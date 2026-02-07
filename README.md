@@ -13,7 +13,7 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 - **Adaptive Bed Mesh** - Probes only the print area, not the entire bed
 - **Tool Offset Calibration** - Prusa G425-equivalent calibration using the calibration pin
 - **Multi-Color / Multi-Material** - Slicer-managed tool temperatures, wipe tower support
-- **Modular Bed Monitoring** - All 16 bedlets visible with temperature tracking
+- **Modular Bed Monitoring** - 16 bedlet temperatures via `BED_STATUS` command
 - **Input Shaper** - Resonance compensation via Dwarf accelerometers
 - **Side LED Strips** - Status effects for printing, heating, paused, complete
 - **Webcam Integration** - USB camera support via Crowsnest
