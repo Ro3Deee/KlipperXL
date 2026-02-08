@@ -2,4 +2,5 @@
 .claude/settings.local.json
 *.pyc
 __pycache__/
+*.tar.gz
 
