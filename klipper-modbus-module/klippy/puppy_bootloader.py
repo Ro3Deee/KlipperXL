@@ -1689,6 +1689,28 @@ class PuppyBootloader:
         # Tool offsets from G425 calibration handle all tool-to-tool differences.
         # This matches how Prusa XL works - no Live-Z or probe offset needed.
 
+        # Filament sensor state (tool sensors via MODBUS 0x8063)
+        # Calibration: {tool_num: [ref_nins, ref_ins]} loaded from variables.cfg
+        self.fs_calibration = {}
+        # Current state per tool: "has_filament", "no_filament", "not_calibrated", "not_connected"
+        self.fs_state = {}
+        # Debounce counter for runout (need 2 consecutive no_filament readings)
+        self.fs_runout_count = {}
+        self.filament_runout_enabled = True
+        # Cal loaded at connect time (save_variables not ready during __init__)
+
+        # Side filament sensor state (ADC3 + mux on XLBuddy sandwich board)
+        # These are the PRIMARY runout sensors (matching Prusa stock firmware)
+        # 5 sensors: 3 left (T0,T1,T2) + 2 right (T3,T4) near spools
+        self.side_fs_cmd = None
+        self.side_fs_calibration = {}    # {tool: [ref_nins, ref_ins]}
+        self.side_fs_state = {}          # {tool: state_string}
+        self.side_fs_raw = {}            # {tool: last_raw_adc}
+        self.side_fs_runout_count = {}   # {tool: consecutive_no_filament_count}
+        self.autoload_enabled = True     # Autoload when side sensor detects insertion
+        self._autoload_in_progress = False
+        self._autoload_insert_count = {}  # {tool: consecutive has_filament count}
+
         # Loadcell state
         self.loadcell_enabled = {}   # {dwarf_num: True/False}
         self.loadcell_offset = {}    # {dwarf_num: raw_offset} for tare
@@ -1790,7 +1812,7 @@ class PuppyBootloader:
         self.gcode.register_command("M217", self.cmd_M217,
             desc="Toolchange settings (stub)")
         self.gcode.register_command("M591", self.cmd_M591,
-            desc="Filament stuck detection (stub)")
+            desc="Filament runout detection enable/disable")
         self.gcode.register_command("M302", self.cmd_M302,
             desc="Cold extrusion setting (stub)")
         # M84/M18 - Override Klipper's default to handle Prusa's axis parameters
@@ -1807,7 +1829,41 @@ class PuppyBootloader:
         self.gcode.register_command("M601", self.cmd_M601,
             desc="Pause print")
         self.gcode.register_command("M600", self.cmd_M600,
-            desc="Filament change")
+            desc="Filament change (pause + unload + load)")
+
+        # Filament sensor commands
+        self.gcode.register_command("CALIBRATE_FILAMENT_SENSOR",
+            self.cmd_CALIBRATE_FILAMENT_SENSOR,
+            desc="Calibrate filament sensor (step 1: remove filament)")
+        self.gcode.register_command("CALIBRATE_FILAMENT_SENSOR_STEP2",
+            self.cmd_CALIBRATE_FILAMENT_SENSOR_STEP2,
+            desc="Calibrate filament sensor (step 2: insert filament)")
+        self.gcode.register_command("SHOW_FILAMENT_SENSORS",
+            self.cmd_SHOW_FILAMENT_SENSORS,
+            desc="Show filament sensor states and calibration")
+        self.gcode.register_command("LOAD_FILAMENT", self.cmd_LOAD_FILAMENT,
+            desc="Load filament into tool (Prusa M701)")
+        self.gcode.register_command("UNLOAD_FILAMENT", self.cmd_UNLOAD_FILAMENT,
+            desc="Unload filament from tool (Prusa M702)")
+
+        # Side filament sensor commands (PRIMARY runout detection)
+        self.gcode.register_command("CALIBRATE_SIDE_SENSOR",
+            self.cmd_CALIBRATE_SIDE_SENSOR,
+            desc="Calibrate side filament sensor (step 1: remove filament)")
+        self.gcode.register_command("CALIBRATE_SIDE_SENSOR_STEP2",
+            self.cmd_CALIBRATE_SIDE_SENSOR_STEP2,
+            desc="Calibrate side filament sensor (step 2: insert filament)")
+        self.gcode.register_command("SHOW_SIDE_SENSORS",
+            self.cmd_SHOW_SIDE_SENSORS,
+            desc="Show side filament sensor states and calibration")
+
+        # Autoload control
+        self.gcode.register_command("AUTOLOAD_FILAMENT",
+            self.cmd_AUTOLOAD_FILAMENT,
+            desc="Manually trigger filament autoload for a tool")
+        self.gcode.register_command("SET_AUTOLOAD",
+            self.cmd_SET_AUTOLOAD,
+            desc="Enable/disable filament autoload (SET_AUTOLOAD ENABLE=0/1)")
 
         # Tool select commands T0-T4
         for i in range(5):
@@ -1984,6 +2040,935 @@ class PuppyBootloader:
     # - Tool offsets from CALIBRATE_TOOL_OFFSETS handle all tool-to-tool differences
     # This matches Prusa XL's approach - no Live-Z needed
 
+    # --- Filament Sensor Methods (Prusa FSensorADC equivalent) ---
+    # Matches Prusa's filament_sensor_adc_eval.cpp algorithm:
+    # - Two-value calibration: ref_nins (no filament) and ref_ins (filament inserted)
+    # - Midpoint detection with 1/6-span hysteresis zone
+    # - Orientation-agnostic (works regardless of magnet polarity)
+
+    # Prusa constants
+    FS_VALUE_SPAN = 1000        # extruder_fs_value_span (hysteresis base for uncalibrated)
+    FS_CAL_MIN_DIFF = 200       # Minimum ADC difference for valid calibration
+                                # (Prusa uses span*1.2=1200 but some sensors swing less)
+    FS_ADC_MIN = 20             # Below this = sensor not connected
+    FS_ADC_MAX = 4096           # 12-bit ADC maximum
+    FS_RUNOUT_DEBOUNCE = 2      # Consecutive no_filament readings before triggering
+
+    # Side sensor constants (Prusa: side filament sensors near spools)
+    SIDE_FS_VALUE_SPAN = 310    # side_fs_value_span (Prusa constant for side sensors)
+    SIDE_FS_CAL_MIN_DIFF = 200  # Side sensors may have smaller swing than tool sensors
+
+    def _load_filament_cal(self):
+        """Load filament sensor calibration from variables.cfg."""
+        try:
+            save_vars = self.printer.lookup_object("save_variables", None)
+            if save_vars is not None:
+                variables = save_vars.allVariables
+                for tool in range(5):
+                    key = f"fs_cal_t{tool}"
+                    cal = variables.get(key, None)
+                    if cal is not None and isinstance(cal, list) and len(cal) == 2:
+                        self.fs_calibration[tool] = cal
+                        logging.info(f"PuppyBootloader: Loaded filament cal T{tool}: "
+                                   f"nins={cal[0]} ins={cal[1]}")
+                # Load runout enabled state
+                enabled = variables.get("fs_runout_enabled", 1)
+                self.filament_runout_enabled = bool(enabled)
+                logging.info(f"PuppyBootloader: Filament runout detection: "
+                           f"{'enabled' if self.filament_runout_enabled else 'disabled'}")
+        except Exception as e:
+            logging.info(f"PuppyBootloader: No filament cal loaded: {e}")
+
+    def _save_filament_cal(self, tool, ref_nins, ref_ins):
+        """Save filament sensor calibration for one tool to variables.cfg."""
+        save_vars = self.printer.lookup_object("save_variables", None)
+        if save_vars is None:
+            raise self.gcode.error("save_variables not configured")
+        key = f"fs_cal_t{tool}"
+        value = f"[{ref_nins}, {ref_ins}]"
+        save_vars.cmd_SAVE_VARIABLE(self.gcode.create_gcode_command(
+            "SAVE_VARIABLE", "SAVE_VARIABLE", {"VARIABLE": key, "VALUE": value}))
+        self.fs_calibration[tool] = [ref_nins, ref_ins]
+        logging.info(f"PuppyBootloader: Saved filament cal T{tool}: nins={ref_nins} ins={ref_ins}")
+
+    def _save_fs_runout_enabled(self):
+        """Save filament runout enabled state to variables.cfg."""
+        save_vars = self.printer.lookup_object("save_variables", None)
+        if save_vars is None:
+            return
+        value = "1" if self.filament_runout_enabled else "0"
+        save_vars.cmd_SAVE_VARIABLE(self.gcode.create_gcode_command(
+            "SAVE_VARIABLE", "SAVE_VARIABLE",
+            {"VARIABLE": "fs_runout_enabled", "VALUE": value}))
+
+    def _evaluate_filament_state(self, filtered_value, tool):
+        """Evaluate filament sensor state matching Prusa's evaluate_state().
+
+        Algorithm from Prusa filament_sensor_adc_eval.cpp:
+        1. Check ADC range (20-4096) for connectivity
+        2. Check if calibrated (ref_nins exists)
+        3. Half-calibrated: use span-based detection
+        4. Full calibration: midpoint with 1/6-span hysteresis
+        """
+        # Not connected check (Prusa: lower_limit=20, upper_limit=4096)
+        if filtered_value < self.FS_ADC_MIN or filtered_value > self.FS_ADC_MAX:
+            return "not_connected"
+
+        cal = self.fs_calibration.get(tool, None)
+        if cal is None:
+            return "not_calibrated"
+
+        ref_nins = cal[0]
+        ref_ins = cal[1] if len(cal) > 1 else None
+
+        # Half-calibrated (only nins set) - use span-based detection
+        if ref_ins is None:
+            if (filtered_value < ref_nins - self.FS_VALUE_SPAN or
+                    filtered_value > ref_nins + self.FS_VALUE_SPAN):
+                return "has_filament"
+            return "no_filament"
+
+        # Full calibration - midpoint with 1/6 hysteresis (Prusa algorithm)
+        midpoint = (ref_nins + ref_ins) // 2
+        hysteresis = abs(ref_nins - ref_ins) // 6
+
+        # In hysteresis zone - maintain previous state to prevent jitter
+        prev_state = self.fs_state.get(tool, "not_calibrated")
+        if prev_state in ("has_filament", "no_filament"):
+            if abs(filtered_value - midpoint) < hysteresis:
+                return prev_state
+
+        # Clear transition - which side of midpoint matches the inserted reference?
+        if (filtered_value > midpoint) == (ref_ins > midpoint):
+            return "has_filament"
+        return "no_filament"
+
+    def _check_filament_runout(self, tool, new_state):
+        """Tool sensor state tracking (logging only).
+
+        Tool sensors are NOT used for runout detection (Prusa uses side sensors).
+        This just logs state transitions for diagnostics. Side sensor
+        _check_side_filament_runout() handles the actual runout PAUSE.
+        """
+        pass
+
+    # --- Side Filament Sensor Methods (PRIMARY runout detection, Prusa stock) ---
+    # Side sensors are mounted near the spools: 3 left (T0,T1,T2) + 2 right (T3,T4)
+    # Read via ADC3 + GPIO-controlled mux on the XLBuddy sandwich board.
+    # Prusa uses these as the PRIMARY runout trigger (not the tool sensors).
+
+    def _load_side_filament_cal(self):
+        """Load side filament sensor calibration from variables.cfg."""
+        try:
+            save_vars = self.printer.lookup_object("save_variables", None)
+            if save_vars is not None:
+                variables = save_vars.allVariables
+                for tool in range(5):
+                    key = f"side_fs_cal_t{tool}"
+                    cal = variables.get(key, None)
+                    if cal is not None and isinstance(cal, list) and len(cal) == 2:
+                        self.side_fs_calibration[tool] = cal
+                        logging.info(f"PuppyBootloader: Loaded side sensor cal T{tool}: "
+                                   f"nins={cal[0]} ins={cal[1]}")
+        except Exception as e:
+            logging.info(f"PuppyBootloader: No side sensor cal loaded: {e}")
+
+    def _save_side_filament_cal(self, tool, ref_nins, ref_ins):
+        """Save side filament sensor calibration for one tool to variables.cfg."""
+        save_vars = self.printer.lookup_object("save_variables", None)
+        if save_vars is None:
+            raise self.gcode.error("save_variables not configured")
+        key = f"side_fs_cal_t{tool}"
+        value = f"[{ref_nins}, {ref_ins}]"
+        save_vars.cmd_SAVE_VARIABLE(self.gcode.create_gcode_command(
+            "SAVE_VARIABLE", "SAVE_VARIABLE", {"VARIABLE": key, "VALUE": value}))
+        self.side_fs_calibration[tool] = [ref_nins, ref_ins]
+        logging.info(f"PuppyBootloader: Saved side sensor cal T{tool}: "
+                   f"nins={ref_nins} ins={ref_ins}")
+
+    def _evaluate_side_filament_state(self, filtered_value, tool):
+        """Evaluate side filament sensor state (same Prusa algorithm, different span).
+
+        Uses SIDE_FS_VALUE_SPAN (310) instead of FS_VALUE_SPAN (1000).
+        """
+        if filtered_value < self.FS_ADC_MIN or filtered_value > self.FS_ADC_MAX:
+            return "not_connected"
+
+        cal = self.side_fs_calibration.get(tool, None)
+        if cal is None:
+            return "not_calibrated"
+
+        ref_nins = cal[0]
+        ref_ins = cal[1] if len(cal) > 1 else None
+
+        # Half-calibrated - use side sensor span
+        if ref_ins is None:
+            if (filtered_value < ref_nins - self.SIDE_FS_VALUE_SPAN or
+                    filtered_value > ref_nins + self.SIDE_FS_VALUE_SPAN):
+                return "has_filament"
+            return "no_filament"
+
+        # Full calibration - midpoint with 1/6 hysteresis
+        midpoint = (ref_nins + ref_ins) // 2
+        hysteresis = abs(ref_nins - ref_ins) // 6
+
+        prev_state = self.side_fs_state.get(tool, "not_calibrated")
+        if prev_state in ("has_filament", "no_filament"):
+            if abs(filtered_value - midpoint) < hysteresis:
+                return prev_state
+
+        if (filtered_value > midpoint) == (ref_ins > midpoint):
+            return "has_filament"
+        return "no_filament"
+
+    def _poll_side_sensors(self):
+        """Query side filament sensors from MCU and update state.
+
+        Called once per poll cycle (after all Dwarfs polled).
+        Uses side sensors as PRIMARY runout detection (matching Prusa).
+        """
+        if self.side_fs_cmd is None:
+            return
+
+        try:
+            result = self.side_fs_cmd.send()
+            for tool in range(5):
+                raw = result.get(f's{tool}', 0)
+                self.side_fs_raw[tool] = raw
+
+                new_state = self._evaluate_side_filament_state(raw, tool)
+                old_state = self.side_fs_state.get(tool, "unknown")
+                self.side_fs_state[tool] = new_state
+
+                if old_state != new_state and old_state != "unknown":
+                    logging.info(f"PuppyBootloader: Side sensor T{tool}: "
+                               f"{old_state} -> {new_state} (raw={raw})")
+
+                # PRIMARY runout detection using side sensors
+                self._check_side_filament_runout(tool, new_state)
+
+                # Autoload detection: side sensor insertion when idle
+                self._check_side_autoload(tool, old_state, new_state)
+        except Exception as e:
+            logging.info(f"PuppyBootloader: Side sensor poll error: {e}")
+
+    def _check_side_filament_runout(self, tool, new_state):
+        """Check for filament runout using side sensors (PRIMARY detection).
+
+        This is how Prusa stock firmware works - side sensors near the spools
+        detect runout BEFORE the filament actually runs out at the tool.
+        Debounces with FS_RUNOUT_DEBOUNCE consecutive readings.
+        """
+        if not self.filament_runout_enabled:
+            return
+        if tool != self.active_tool:
+            return
+
+        # Only check during actual printing
+        try:
+            print_stats = self.printer.lookup_object('print_stats', None)
+            if print_stats is None:
+                return
+            stats = print_stats.get_status(self.reactor.monotonic())
+            if stats.get('state', '') != 'printing':
+                return
+        except:
+            return
+
+        if new_state == "no_filament":
+            count = self.side_fs_runout_count.get(tool, 0) + 1
+            self.side_fs_runout_count[tool] = count
+            if count >= self.FS_RUNOUT_DEBOUNCE:
+                logging.warning(f"PuppyBootloader: SIDE SENSOR RUNOUT on T{tool}! "
+                              f"({count} consecutive readings)")
+                self.gcode.respond_info(
+                    f"!! Filament runout detected on T{tool} (side sensor)! "
+                    f"Pausing print.")
+                self.side_fs_runout_count[tool] = 0
+                try:
+                    self.gcode.run_script_from_command("PAUSE")
+                except Exception as e:
+                    logging.error(f"PuppyBootloader: PAUSE failed after runout: {e}")
+            else:
+                logging.info(f"PuppyBootloader: Side sensor T{tool} no_filament "
+                           f"({count}/{self.FS_RUNOUT_DEBOUNCE})")
+        else:
+            self.side_fs_runout_count[tool] = 0
+
+    def _check_side_autoload(self, tool, old_state, new_state):
+        """Check for filament insertion on side sensor to trigger autoload.
+
+        Prusa autoload: when side sensor detects insertion while idle,
+        automatically pick tool, slow load to gears, heat, fast load,
+        purge, and retract. Only triggers when not printing.
+        """
+        if not self.autoload_enabled:
+            return
+        if self._autoload_in_progress:
+            return
+
+        # Only autoload when idle
+        try:
+            print_stats = self.printer.lookup_object('print_stats', None)
+            if print_stats is not None:
+                stats = print_stats.get_status(self.reactor.monotonic())
+                state = stats.get('state', '')
+                if state in ('printing', 'paused'):
+                    return
+        except:
+            pass
+
+        # Detect no_filament -> has_filament transition (immediate trigger)
+        if new_state == "has_filament" and old_state == "no_filament":
+            logging.info(f"PuppyBootloader: Side sensor T{tool} insertion "
+                       f"detected - scheduling autoload")
+            self.gcode.respond_info(
+                f"Filament detected in T{tool} side sensor - autoloading...")
+            self._autoload_in_progress = True
+            # Schedule autoload outside poll loop so polls keep running
+            self.reactor.register_callback(
+                lambda e, t=tool: self._do_autoload_async(t))
+
+    def _do_autoload_async(self, tool):
+        """Run autoload outside the poll loop context."""
+        try:
+            self._do_autoload(tool)
+        except Exception as e:
+            logging.error(f"PuppyBootloader: Autoload T{tool} failed: {e}")
+            self.gcode.respond_info(f"Autoload T{tool} failed: {e}")
+        finally:
+            self._autoload_in_progress = False
+
+    def _read_tool_sensor(self, dwarf):
+        """Direct MODBUS read of tool filament sensor ADC for a specific Dwarf.
+
+        Used during autoload to check sensor between extrusion increments.
+        Reads just register 0x8063 (filament_sensor) from the Dwarf.
+        Returns raw ADC value, or None on failure.
+        """
+        addr = self.ADDR_MODBUS_OFFSET + dwarf
+        reg_start = 0x8063  # filament_sensor register
+        count = 1
+        data = [
+            (reg_start >> 8) & 0xFF, reg_start & 0xFF,
+            (count >> 8) & 0xFF, count & 0xFF
+        ]
+        frame = self._build_modbus_frame(addr, self.MODBUS_READ_INPUT, data)
+        try:
+            response = self._send_frame(frame)
+            status = response.get('status', -1)
+            resp_data = response.get('data', b'')
+            if status == 0 and resp_data and len(resp_data) >= 5:
+                val = (resp_data[3] << 8) | resp_data[4]
+                return val
+            return None
+        except Exception:
+            return None
+
+    def _do_autoload(self, tool):
+        """Execute autoload sequence for a tool (Prusa M1701 equivalent).
+
+        Matches Prusa's stock firmware autoload sequence:
+        1. Pick tool if not active
+        2. Assist insertion: chunked E moves @ 5.4mm/s (cold extrude OK),
+           check tool sensor between chunks, 40 second timeout
+        3. Slow load: 30mm @ 5.4mm/s (catch filament in gears)
+        4. Heat to extrusion temperature, wait until reached
+        5. Fast load: 50mm @ 18mm/s (fill hotend)
+        6. Purge: 27mm @ 2.7mm/s (prime nozzle)
+        7. Retract: 4mm @ 35mm/s (prevent ooze)
+        8. Turn off heater
+        """
+        dwarf = tool + 1
+        if dwarf not in self.booted_dwarfs:
+            self.gcode.respond_info(
+                f"T{tool}/Dwarf {dwarf} not booted - cannot autoload")
+            return
+
+        # Check filament sensor calibration
+        cal = self.fs_calibration.get(tool, None)
+        if cal is None or len(cal) < 2:
+            self.gcode.respond_info(
+                f"T{tool}: Tool sensor not calibrated - run "
+                f"CALIBRATE_FILAMENT_SENSOR TOOL={tool} first")
+            return
+
+        # Pick tool if not active
+        if self.active_tool != tool:
+            self.gcode.respond_info(f"Picking T{tool}...")
+            self.gcode.run_script(f"T{tool}")
+
+        toolhead = self.printer.lookup_object('toolhead')
+
+        # Disable min_extrude_temp for the ENTIRE autoload sequence.
+        # Prusa sets allow_cold_extrude=true during assist insertion.
+        extruder = self.printer.lookup_object('extruder', None)
+        heater = extruder.get_heater() if extruder is not None else None
+        saved_min_temp = None
+        if heater is not None:
+            saved_min_temp = heater.min_extrude_temp
+            heater.min_extrude_temp = 0
+            heater.can_extrude = True
+
+        try:
+            # --- Phase 1: Assist insertion (Prusa assist_insertion_process) ---
+            # Chunked E moves @ 5.4mm/s. Check tool sensor state from
+            # regular poll cycle (fs_state) between chunks - same as Prusa,
+            # which uses cached sensor value from normal MODBUS polling.
+            # Prusa: 0.1mm chunks, 40 second timeout.
+
+            # Check current sensor state before starting
+            cur_state = self.fs_state.get(tool, "unknown")
+            if cur_state == "has_filament":
+                self.gcode.respond_info(
+                    f"T{tool}: Sensor already reads filament - "
+                    f"check filament is removed")
+                return
+
+            logging.info(f"PuppyBootloader: Autoload T{tool} phase 1: "
+                        f"assist @ 5.4mm/s, state={cur_state}")
+            self.gcode.respond_info(
+                f"T{tool}: Extruder turning - push filament in...")
+            self.gcode.run_script("G92 E0")
+
+            chunk_mm = 2.0
+            speed = 5.4  # Prusa FILAMENT_CHANGE_SLOW_LOAD_FEEDRATE
+            timeout = 40.0  # Prusa assist_insertion timeout
+            start_time = self.reactor.monotonic()
+            sensor_triggered = False
+
+            while (self.reactor.monotonic() - start_time) < timeout:
+                # Extrude one chunk
+                pos = list(toolhead.get_position())
+                pos[3] += chunk_mm
+                toolhead.manual_move(pos, speed)
+                toolhead.wait_moves()
+
+                # Check tool sensor state from regular poll cycle
+                if self.fs_state.get(tool) == "has_filament":
+                    sensor_triggered = True
+                    logging.info(f"PuppyBootloader: Autoload T{tool} "
+                                f"tool sensor detected filament")
+                    break
+
+            if not sensor_triggered:
+                self.gcode.respond_info(
+                    f"T{tool}: Tool sensor not triggered after "
+                    f"{timeout:.0f}s - aborting")
+                return
+
+            self.gcode.respond_info(f"T{tool}: Filament at tool sensor")
+
+            # --- Phase 1b: Slow load 30mm @ 5.4mm/s (Prusa load_to_gears) ---
+            logging.info(f"PuppyBootloader: Autoload T{tool} phase 1b: "
+                        f"slow load 30mm @ 5.4mm/s")
+            pos = list(toolhead.get_position())
+            pos[3] += 30.0
+            toolhead.manual_move(pos, 5.4)
+            toolhead.wait_moves()
+
+            # --- Phase 2: Heat to extrusion temperature ---
+            temp = self.target_temps.get(dwarf, 0)
+            if temp < 170:
+                temp = 200  # Default load temp if nothing set
+            self.gcode.respond_info(f"T{tool}: Heating to {temp}C...")
+            logging.info(f"PuppyBootloader: Autoload T{tool} phase 2: "
+                        f"heating to {temp}C via M109")
+            self.gcode.run_script(f"M109 T{tool} S{temp}")
+            logging.info(f"PuppyBootloader: Autoload T{tool} M109 returned")
+
+            # --- Phase 3: Fast load 50mm @ 18mm/s (gear to nozzle) ---
+            self.gcode.run_script("G92 E0")
+            self.gcode.respond_info(f"T{tool}: Fast loading to nozzle...")
+            logging.info(f"PuppyBootloader: Autoload T{tool} phase 3: "
+                        f"fast load 50mm @ 18mm/s")
+            pos = list(toolhead.get_position())
+            pos[3] += 50.0
+            toolhead.manual_move(pos, 18.0)
+            toolhead.wait_moves()
+
+            # --- Phase 4: Purge 27mm @ 2.7mm/s (prime nozzle) ---
+            self.gcode.respond_info(f"T{tool}: Purging...")
+            logging.info(f"PuppyBootloader: Autoload T{tool} phase 4: "
+                        f"purge 27mm @ 2.7mm/s")
+            pos = list(toolhead.get_position())
+            pos[3] += 27.0
+            toolhead.manual_move(pos, 2.7)
+            toolhead.wait_moves()
+
+            # --- Phase 5: Retract 4mm @ 35mm/s (prevent ooze) ---
+            logging.info(f"PuppyBootloader: Autoload T{tool} phase 5: "
+                        f"retract 4mm @ 35mm/s")
+            pos = list(toolhead.get_position())
+            pos[3] -= 4.0
+            toolhead.manual_move(pos, 35.0)
+            toolhead.wait_moves()
+
+            # --- Phase 6: Turn off heater ---
+            self.gcode.run_script(f"M104 T{tool} S0")
+            self.gcode.respond_info(f"T{tool}: Autoload complete!")
+            logging.info(f"PuppyBootloader: Autoload T{tool} complete")
+
+        finally:
+            # Restore min extrude temp
+            if heater is not None and saved_min_temp is not None:
+                heater.min_extrude_temp = saved_min_temp
+
+    def cmd_CALIBRATE_SIDE_SENSOR(self, gcmd):
+        """Start side filament sensor calibration (step 1: remove filament).
+
+        CALIBRATE_SIDE_SENSOR [TOOL=n]
+        Step 1: Remove filament from spool holder, run this to record empty.
+        Step 2: Insert filament, run CALIBRATE_SIDE_SENSOR_STEP2.
+        """
+        if self.side_fs_cmd is None:
+            raise gcmd.error("Side sensors not available (MCU firmware update needed)")
+
+        tool = gcmd.get_int('TOOL', None)
+        tools = [tool] if tool is not None else list(range(5))
+
+        # Read current values
+        try:
+            result = self.side_fs_cmd.send()
+        except Exception as e:
+            raise gcmd.error(f"Failed to read side sensors: {e}")
+
+        for t in tools:
+            raw = result.get(f's{t}', 0)
+
+            if raw < self.FS_ADC_MIN or raw > self.FS_ADC_MAX:
+                gcmd.respond_info(f"T{t}: Side sensor not connected (raw={raw})")
+                continue
+
+            self.side_fs_calibration[t] = [raw]  # Partial cal (nins only)
+            gcmd.respond_info(f"T{t}: Side sensor no-filament reference = {raw}")
+
+        gcmd.respond_info(
+            "Step 1 complete. Now INSERT filament into the side sensor(s) and run:\n"
+            "  CALIBRATE_SIDE_SENSOR_STEP2 [TOOL=n]")
+
+    def cmd_CALIBRATE_SIDE_SENSOR_STEP2(self, gcmd):
+        """Complete side sensor calibration (step 2: with filament inserted).
+
+        CALIBRATE_SIDE_SENSOR_STEP2 [TOOL=n]
+        """
+        if self.side_fs_cmd is None:
+            raise gcmd.error("Side sensors not available (MCU firmware update needed)")
+
+        tool = gcmd.get_int('TOOL', None)
+        tools = [tool] if tool is not None else list(range(5))
+
+        try:
+            result = self.side_fs_cmd.send()
+        except Exception as e:
+            raise gcmd.error(f"Failed to read side sensors: {e}")
+
+        for t in tools:
+            cal = self.side_fs_calibration.get(t, None)
+            if cal is None or len(cal) < 1:
+                gcmd.respond_info(f"T{t}: Run CALIBRATE_SIDE_SENSOR first (step 1)")
+                continue
+
+            ref_nins = cal[0]
+            raw = result.get(f's{t}', 0)
+
+            if raw < self.FS_ADC_MIN or raw > self.FS_ADC_MAX:
+                gcmd.respond_info(f"T{t}: Side sensor not connected (raw={raw})")
+                continue
+
+            diff = abs(raw - ref_nins)
+            if diff < self.SIDE_FS_CAL_MIN_DIFF:
+                gcmd.respond_info(
+                    f"T{t}: FAILED - inserted value ({raw}) too close to "
+                    f"empty value ({ref_nins}). Difference {diff} must be > "
+                    f"{self.SIDE_FS_CAL_MIN_DIFF}. Check filament is in the sensor.")
+                self.side_fs_calibration.pop(t, None)
+                continue
+
+            self._save_side_filament_cal(t, ref_nins, raw)
+            midpoint = (ref_nins + raw) // 2
+            hysteresis = abs(ref_nins - raw) // 6
+            gcmd.respond_info(
+                f"T{t}: Side sensor calibrated! nins={ref_nins} ins={raw} "
+                f"midpoint={midpoint} hysteresis=±{hysteresis}")
+
+    def cmd_SHOW_SIDE_SENSORS(self, gcmd):
+        """Show side filament sensor states for all tools."""
+        if self.side_fs_cmd is None:
+            gcmd.respond_info("Side sensors not available (MCU firmware update needed)")
+            return
+
+        # Read fresh values
+        try:
+            result = self.side_fs_cmd.send()
+        except Exception as e:
+            gcmd.respond_info(f"Failed to read side sensors: {e}")
+            return
+
+        lines = [f"Side filament sensors (PRIMARY runout detection):"]
+        lines.append(f"Runout detection: "
+                    f"{'ENABLED' if self.filament_runout_enabled else 'DISABLED'}")
+        for tool in range(5):
+            raw = result.get(f's{tool}', 0)
+            self.side_fs_raw[tool] = raw
+            state = self._evaluate_side_filament_state(raw, tool)
+            self.side_fs_state[tool] = state
+            cal = self.side_fs_calibration.get(tool, None)
+            if cal is not None and len(cal) == 2:
+                cal_str = f"nins={cal[0]} ins={cal[1]}"
+            elif cal is not None and len(cal) == 1:
+                cal_str = f"nins={cal[0]} (step 2 needed)"
+            else:
+                cal_str = "NOT CALIBRATED"
+            lines.append(f"  T{tool}: {state:16s} raw={raw:5d}  cal={cal_str}")
+        gcmd.respond_info("\n".join(lines))
+
+    def cmd_AUTOLOAD_FILAMENT(self, gcmd):
+        """Manually trigger autoload for a tool.
+
+        AUTOLOAD_FILAMENT [TOOL=n]
+        """
+        tool = gcmd.get_int('TOOL', self.active_tool)
+        if tool is None or tool < 0:
+            raise gcmd.error("No tool specified and no active tool")
+        if self._autoload_in_progress:
+            raise gcmd.error("Autoload already in progress")
+        try:
+            self._autoload_in_progress = True
+            self._do_autoload(tool)
+        except Exception as e:
+            raise gcmd.error(f"Autoload failed: {e}")
+        finally:
+            self._autoload_in_progress = False
+
+    def cmd_SET_AUTOLOAD(self, gcmd):
+        """Enable or disable filament autoload.
+
+        SET_AUTOLOAD ENABLE=1  - Enable autoload
+        SET_AUTOLOAD ENABLE=0  - Disable autoload
+        SET_AUTOLOAD           - Show current state
+        """
+        enable = gcmd.get_int('ENABLE', None)
+        if enable is not None:
+            self.autoload_enabled = bool(enable)
+            gcmd.respond_info(
+                f"Filament autoload: "
+                f"{'ENABLED' if self.autoload_enabled else 'DISABLED'}")
+        else:
+            gcmd.respond_info(
+                f"Filament autoload: "
+                f"{'ENABLED' if self.autoload_enabled else 'DISABLED'}")
+
+    def cmd_CALIBRATE_FILAMENT_SENSOR(self, gcmd):
+        """Start filament sensor calibration.
+
+        CALIBRATE_FILAMENT_SENSOR [TOOL=n]
+        Step 1: Remove filament, run this command to record empty value.
+        Then run CALIBRATE_FILAMENT_SENSOR_STEP2 TOOL=n with filament inserted.
+        """
+        tool = gcmd.get_int('TOOL', None)
+        if tool is not None:
+            tools = [tool]
+        else:
+            tools = list(range(len(self.booted_dwarfs)))
+
+        for t in tools:
+            dwarf = t + 1
+            if dwarf not in self.booted_dwarfs:
+                gcmd.respond_info(f"T{t}: Dwarf {dwarf} not booted, skipping")
+                continue
+
+            data = self.dwarf_data.get(dwarf, {})
+            raw = data.get('filament_sensor', 0)
+
+            if raw < self.FS_ADC_MIN or raw > self.FS_ADC_MAX:
+                gcmd.respond_info(f"T{t}: Sensor not connected (raw={raw})")
+                continue
+
+            # Store no-filament reference (step 1)
+            self.fs_calibration[t] = [raw]  # Partial cal (nins only)
+            gcmd.respond_info(f"T{t}: No-filament reference = {raw}")
+
+        gcmd.respond_info(
+            "Step 1 complete. Now INSERT filament into the tool(s) and run:\n"
+            "  CALIBRATE_FILAMENT_SENSOR_STEP2 [TOOL=n]")
+
+    def cmd_CALIBRATE_FILAMENT_SENSOR_STEP2(self, gcmd):
+        """Complete filament sensor calibration (with filament inserted).
+
+        CALIBRATE_FILAMENT_SENSOR_STEP2 [TOOL=n]
+        Records inserted value and validates against step 1.
+        """
+        tool = gcmd.get_int('TOOL', None)
+        if tool is not None:
+            tools = [tool]
+        else:
+            tools = list(range(len(self.booted_dwarfs)))
+
+        for t in tools:
+            dwarf = t + 1
+            if dwarf not in self.booted_dwarfs:
+                gcmd.respond_info(f"T{t}: Dwarf {dwarf} not booted, skipping")
+                continue
+
+            cal = self.fs_calibration.get(t, None)
+            if cal is None or len(cal) < 1:
+                gcmd.respond_info(f"T{t}: Run CALIBRATE_FILAMENT_SENSOR first (step 1)")
+                continue
+
+            ref_nins = cal[0]
+            data = self.dwarf_data.get(dwarf, {})
+            raw = data.get('filament_sensor', 0)
+
+            if raw < self.FS_ADC_MIN or raw > self.FS_ADC_MAX:
+                gcmd.respond_info(f"T{t}: Sensor not connected (raw={raw})")
+                continue
+
+            # Validate: inserted value must differ from empty by minimum threshold
+            # Prusa uses span*1.2=1200 but some tool sensors swing less (T4: ~674 units)
+            # 300 ADC units is enough for reliable midpoint+hysteresis detection
+            diff = abs(raw - ref_nins)
+            if diff < self.FS_CAL_MIN_DIFF:
+                gcmd.respond_info(
+                    f"T{t}: FAILED - inserted value ({raw}) too close to "
+                    f"empty value ({ref_nins}). Difference {diff} must be > "
+                    f"{self.FS_CAL_MIN_DIFF}. Check that filament is fully inserted.")
+                # Invalidate calibration
+                self.fs_calibration.pop(t, None)
+                continue
+
+            # Save calibration
+            self._save_filament_cal(t, ref_nins, raw)
+            midpoint = (ref_nins + raw) // 2
+            hysteresis = abs(ref_nins - raw) // 6
+            gcmd.respond_info(
+                f"T{t}: Calibrated! nins={ref_nins} ins={raw} "
+                f"midpoint={midpoint} hysteresis=±{hysteresis}")
+
+    def cmd_SHOW_FILAMENT_SENSORS(self, gcmd):
+        """Show all filament sensor states (tool + side sensors)."""
+        if not self.booted_dwarfs:
+            gcmd.respond_info("No Dwarfs booted")
+            return
+
+        lines = [f"Filament runout detection: "
+                 f"{'ENABLED' if self.filament_runout_enabled else 'DISABLED'}"]
+
+        # Tool sensors (MODBUS 0x8063, load/unload confirmation)
+        lines.append("Tool sensors (load/unload confirmation):")
+        for dwarf in sorted(self.booted_dwarfs):
+            tool = dwarf - 1
+            data = self.dwarf_data.get(dwarf, {})
+            raw = data.get('filament_sensor', 0)
+            state = self.fs_state.get(tool, "unknown")
+            cal = self.fs_calibration.get(tool, None)
+            if cal is not None and len(cal) == 2:
+                cal_str = f"nins={cal[0]} ins={cal[1]}"
+            elif cal is not None and len(cal) == 1:
+                cal_str = f"nins={cal[0]} (step 2 needed)"
+            else:
+                cal_str = "NOT CALIBRATED"
+            lines.append(f"  T{tool}: {state:16s} raw={raw:5d}  cal={cal_str}")
+
+        # Side sensors (ADC3 + mux, PRIMARY runout)
+        if self.side_fs_cmd is not None:
+            lines.append("Side sensors (PRIMARY runout detection):")
+            try:
+                result = self.side_fs_cmd.send()
+                for tool in range(5):
+                    raw = result.get(f's{tool}', 0)
+                    state = self._evaluate_side_filament_state(raw, tool)
+                    cal = self.side_fs_calibration.get(tool, None)
+                    if cal is not None and len(cal) == 2:
+                        cal_str = f"nins={cal[0]} ins={cal[1]}"
+                    elif cal is not None and len(cal) == 1:
+                        cal_str = f"nins={cal[0]} (step 2 needed)"
+                    else:
+                        cal_str = "NOT CALIBRATED"
+                    lines.append(f"  T{tool}: {state:16s} raw={raw:5d}  cal={cal_str}")
+            except Exception as e:
+                lines.append(f"  Error reading side sensors: {e}")
+        else:
+            lines.append("Side sensors: NOT AVAILABLE (MCU firmware update needed)")
+
+        gcmd.respond_info("\n".join(lines))
+
+    def cmd_M591(self, gcmd):
+        """M591 - Filament runout detection enable/disable.
+
+        M591 S0 - Disable runout detection
+        M591 S1 - Enable runout detection
+        M591    - Show current state
+        """
+        s = gcmd.get_int('S', None)
+        if s == 0:
+            self.filament_runout_enabled = False
+            self._save_fs_runout_enabled()
+            gcmd.respond_info("Filament runout detection DISABLED")
+        elif s == 1:
+            self.filament_runout_enabled = True
+            self._save_fs_runout_enabled()
+            gcmd.respond_info("Filament runout detection ENABLED")
+        else:
+            state = "ENABLED" if self.filament_runout_enabled else "DISABLED"
+            gcmd.respond_info(f"Filament runout detection: {state}")
+
+    def cmd_UNLOAD_FILAMENT(self, gcmd):
+        """Unload filament from a tool (Prusa M702 equivalent).
+
+        UNLOAD_FILAMENT [TOOL=n] [TEMP=t]
+        Heats nozzle, rams, retracts filament.
+        Prusa speeds: unload 27mm/s, ram push then retract.
+        """
+        tool = gcmd.get_int('TOOL', self.active_tool)
+        temp = gcmd.get_float('TEMP', 0)
+        dwarf = tool + 1
+
+        if dwarf not in self.booted_dwarfs:
+            raise gcmd.error(f"T{tool}/Dwarf {dwarf} not booted")
+
+        # Pick tool if not active
+        if self.active_tool != tool:
+            gcmd.respond_info(f"Picking T{tool}...")
+            self.gcode.run_script_from_command(f"T{tool}")
+
+        # Determine temperature
+        if temp <= 0:
+            temp = self.target_temps.get(dwarf, 0)
+        if temp < 170:
+            temp = 200  # Minimum safe unload temp
+            gcmd.respond_info(f"Using default unload temp: {temp}C")
+
+        # Heat and wait
+        gcmd.respond_info(f"Heating T{tool} to {temp}C for unload...")
+        self.gcode.run_script_from_command(f"M109 T{tool} S{temp}")
+
+        # Disable extruder stepper current reduction (Prusa: disable_e_steppers for noise)
+        # Ram forward to clear nozzle tip (simplified Prusa ramming)
+        gcmd.respond_info("Ramming...")
+        # Short push forward: 2mm at 10mm/s (clear nozzle tip)
+        self.gcode.run_script_from_command("G92 E0")
+        self.gcode.run_script_from_command("G1 E2 F600")   # 10mm/s push
+        self.gcode.run_script_from_command("G1 E0 F600")   # retract back
+        self.gcode.run_script_from_command("G4 P500")       # 500ms settle
+
+        # Full retract: 27mm/s = 1620mm/min, ~80mm retract
+        gcmd.respond_info("Retracting filament...")
+        self.gcode.run_script_from_command("G1 E-80 F1620")
+        self.gcode.run_script_from_command("G92 E0")
+
+        # Check sensor
+        data = self.dwarf_data.get(dwarf, {})
+        raw = data.get('filament_sensor', 0)
+        state = self._evaluate_filament_state(raw, tool)
+        if state == "no_filament":
+            gcmd.respond_info(f"T{tool}: Filament unloaded successfully")
+        elif state == "not_calibrated":
+            gcmd.respond_info(f"T{tool}: Unload complete (sensor not calibrated)")
+        else:
+            gcmd.respond_info(
+                f"T{tool}: WARNING - sensor still reads '{state}' (raw={raw}). "
+                f"Filament may not be fully unloaded. Pull manually if needed.")
+
+    def cmd_LOAD_FILAMENT(self, gcmd):
+        """Load filament into a tool (Prusa M701 equivalent).
+
+        LOAD_FILAMENT [TOOL=n] [TEMP=t]
+        Waits for sensor, slow loads to gears, heats, fast loads, purges.
+        Prusa speeds: slow 5.4mm/s, fast 18mm/s, purge 2.7mm/s.
+        """
+        tool = gcmd.get_int('TOOL', self.active_tool)
+        temp = gcmd.get_float('TEMP', 0)
+        dwarf = tool + 1
+
+        if dwarf not in self.booted_dwarfs:
+            raise gcmd.error(f"T{tool}/Dwarf {dwarf} not booted")
+
+        # Pick tool if not active
+        if self.active_tool != tool:
+            gcmd.respond_info(f"Picking T{tool}...")
+            self.gcode.run_script_from_command(f"T{tool}")
+
+        gcmd.respond_info(f"Insert filament into T{tool} and push until it grabs...")
+
+        # Wait for tool sensor to detect filament (timeout 120s)
+        cal = self.fs_calibration.get(tool, None)
+        if cal is not None and len(cal) == 2:
+            start_time = self.reactor.monotonic()
+            timeout = 120.0
+            detected = False
+            while (self.reactor.monotonic() - start_time) < timeout:
+                data = self.dwarf_data.get(dwarf, {})
+                raw = data.get('filament_sensor', 0)
+                state = self._evaluate_filament_state(raw, tool)
+                if state == "has_filament":
+                    detected = True
+                    break
+                self.reactor.pause(self.reactor.monotonic() + 1.0)
+            if not detected:
+                gcmd.respond_info(
+                    f"T{tool}: Timeout waiting for filament sensor. "
+                    f"Continuing with load anyway...")
+        else:
+            gcmd.respond_info("Sensor not calibrated - waiting 5s for manual insertion...")
+            self.reactor.pause(self.reactor.monotonic() + 5.0)
+
+        # Determine temperature
+        if temp <= 0:
+            temp = self.target_temps.get(dwarf, 0)
+        if temp < 170:
+            temp = 200  # Minimum safe load temp
+            gcmd.respond_info(f"Using default load temp: {temp}C")
+
+        # Slow load to gears: 5.4mm/s = 324mm/min, 30mm
+        # Prusa allows cold extrusion for this step
+        gcmd.respond_info("Slow loading to gears...")
+        self.gcode.run_script_from_command("G92 E0")
+        self.gcode.run_script_from_command("M302 P1")       # Allow cold extrusion
+        self.gcode.run_script_from_command("G1 E30 F324")    # 5.4mm/s, 30mm
+        self.gcode.run_script_from_command("M302 S170")      # Restore cold extrusion limit
+
+        # Heat and wait
+        gcmd.respond_info(f"Heating T{tool} to {temp}C...")
+        self.gcode.run_script_from_command(f"M109 T{tool} S{temp}")
+
+        # Fast load: 18mm/s = 1080mm/min, 40mm (fill hotend)
+        gcmd.respond_info("Fast loading...")
+        self.gcode.run_script_from_command("G1 E40 F1080")
+
+        # Purge: 2.7mm/s = 162mm/min, 27mm
+        gcmd.respond_info("Purging...")
+        self.gcode.run_script_from_command("G1 E27 F162")
+
+        # Retract to prevent ooze: 35mm/s = 2100mm/min, 4mm
+        self.gcode.run_script_from_command("G1 E-4 F2100")
+        self.gcode.run_script_from_command("G92 E0")
+
+        gcmd.respond_info(f"T{tool}: Filament loaded and purged")
+
+    def cmd_M600(self, gcmd):
+        """M600 - Filament change (Prusa compatibility).
+
+        Pauses print, unloads old filament, waits for new filament,
+        loads and purges, then user resumes.
+        """
+        tool = gcmd.get_int('T', self.active_tool)
+        logging.info(f"PuppyBootloader: M600 filament change T{tool}")
+        gcmd.respond_info(f"Filament change on T{tool} - pausing print...")
+
+        # Pause print (PAUSE macro handles parking, Z lift, etc.)
+        self.gcode.run_script_from_command("PAUSE")
+
+        # Unload old filament
+        gcmd.respond_info("Unloading old filament...")
+        self.gcode.run_script_from_command(f"UNLOAD_FILAMENT TOOL={tool}")
+
+        # Wait for user to insert new filament and run LOAD + RESUME
+        gcmd.respond_info(
+            "Old filament unloaded. Insert new filament and run:\n"
+            "  LOAD_FILAMENT TOOL={tool}\n"
+            "  RESUME")
+
     def _handle_connect(self):
         try:
             self.send_raw_cmd = self.mcu.lookup_query_command(
@@ -2087,6 +3072,22 @@ class PuppyBootloader:
         except Exception as e:
             logging.warning(f"PuppyBootloader: loadcell_endstop_home not available: {e}")
             self.loadcell_home_cmd = None
+
+        # Load filament sensor calibration (save_variables is ready at connect time)
+        self._load_filament_cal()
+        self._load_side_filament_cal()
+
+        # Side filament sensors (ADC3 + mux on XLBuddy sandwich board)
+        try:
+            self.side_fs_cmd = self.mcu.lookup_query_command(
+                "query_side_filament_sensors",
+                "side_filament_sensors_result s0=%u s1=%u s2=%u s3=%u s4=%u",
+                is_async=True)
+            logging.info("PuppyBootloader: Found query_side_filament_sensors command")
+        except Exception as e:
+            logging.info(f"PuppyBootloader: Side filament sensors not available "
+                        f"(firmware update needed): {e}")
+            self.side_fs_cmd = None
 
         # Run automatic boot sequence
         self._auto_boot_dwarfs()
@@ -2724,6 +3725,17 @@ class PuppyBootloader:
                         'heatbreak_temp': regs[6] if regs[6] < 0x8000 else regs[6] - 0x10000,
                         '_poll_time': self.reactor.monotonic(),  # Timestamp for staleness check
                     }
+
+                    # Evaluate filament sensor state and check for runout
+                    tool = dwarf - 1
+                    fs_raw = regs[3]
+                    new_state = self._evaluate_filament_state(fs_raw, tool)
+                    old_state = self.fs_state.get(tool, "unknown")
+                    self.fs_state[tool] = new_state
+                    if old_state != new_state and old_state != "unknown":
+                        logging.info(f"PuppyBootloader: T{tool} filament: "
+                                   f"{old_state} -> {new_state} (raw={fs_raw})")
+                    self._check_filament_runout(tool, new_state)
             else:
                 # Poll failed - clear poll_time to trigger staleness detection
                 if dwarf in self.dwarf_data:
@@ -2744,6 +3756,9 @@ class PuppyBootloader:
             # Poll modular bed to keep its watchdog alive (30 second timeout)
             if self.modular_bed_booted:
                 self._poll_bed()
+
+            # Poll side filament sensors (PRIMARY runout detection)
+            self._poll_side_sensors()
 
             # Sync heater target to MODBUS (every cycle or every few cycles)
             self._heater_sync_counter = getattr(self, '_heater_sync_counter', 0) + 1
@@ -5651,21 +6666,6 @@ class PuppyBootloader:
         params = gcmd.get_commandline()
         logging.info(f"PuppyBootloader: M217 toolchange settings stub - {params}")
 
-    def cmd_M591(self, gcmd):
-        """M591 - Filament stuck/runout detection (Prusa XL compatibility stub)
-
-        M591 S<0/1> [R] - Enable/disable stuck detection
-        - S0: Disable
-        - S1: Enable
-        - R: Restore previous setting
-
-        Currently a stub. Filament runout sensing requires additional
-        hardware integration.
-        """
-        s = gcmd.get_int('S', None)
-        r = gcmd.get_int('R', None)
-        logging.info(f"PuppyBootloader: M591 filament detection stub - S={s} R={r}")
-
     def cmd_M302(self, gcmd):
         """M302 - Cold extrusion settings (Prusa XL compatibility stub)
 
@@ -5870,16 +6870,6 @@ class PuppyBootloader:
         logging.info("PuppyBootloader: M601 pause print")
         self.gcode.run_script_from_command("PAUSE")
 
-    def cmd_M600(self, gcmd):
-        """M600 - Filament change (Prusa compatibility)
-
-        Pauses print for filament change. Currently maps to PAUSE.
-        Future: Add filament unload/load sequence.
-        """
-        logging.info("PuppyBootloader: M600 filament change")
-        self.gcode.respond_info("Filament change - pausing print")
-        self.gcode.run_script_from_command("PAUSE")
-
     def cmd_DWARF_STATUS(self, gcmd):
         """Show status of all Dwarfs"""
         if not self.booted_dwarfs:
@@ -5893,10 +6883,11 @@ class PuppyBootloader:
             hotend = data.get('hotend_temp', 0)
             board = data.get('board_temp', 0)
             heatbreak = data.get('heatbreak_temp', 0)
+            fs = data.get('filament_sensor', 0)
             lines.append(
                 f"  T{dwarf-1}/Dwarf{dwarf}: hotend={hotend}C"
                 f" target={target}C heatbreak={heatbreak}C"
-                f" board={board}C fan={fan}/255")
+                f" board={board}C fan={fan}/255 fs={fs}")
         self.gcode.respond_info("\n".join(lines))
 
     def _register_bedlet_sensors(self):

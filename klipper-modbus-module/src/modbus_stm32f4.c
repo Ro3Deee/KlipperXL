@@ -48,6 +48,22 @@ static void puppy_boot_sequence(void);
 #define PCA9557_REG_POLARITY   0x02
 #define PCA9557_REG_CONFIG     0x03
 
+// Side filament sensors (sandwich board, ADC3 via mux)
+// Matches Prusa XLBuddy hardware: 2x2 analog mux on ADC3
+// ADC channels: PC0 = ADC3_IN10 (mux_x), PF6 = ADC3_IN4 (mux_y)
+// Mux select: PF12 = setA, PG6 = setB
+// Mux positions:
+//   pos 0 (A=0,B=0): X=sfs1(T0), Y=sfs2(T1)
+//   pos 1 (A=1,B=0): X=sfs3(T2), Y=sfs4(unused)
+//   pos 2 (A=0,B=1): X=sfs5(T4), Y=sfs6(T3)
+//   pos 3 (A=1,B=1): X=sandwich_temp, Y=ambient_temp
+#define SFS_MUX_A_PORT    GPIOF
+#define SFS_MUX_A_PIN     12
+#define SFS_MUX_B_PORT    GPIOG
+#define SFS_MUX_B_PIN     6
+#define SFS_ADC_X_CHANNEL 10    // PC0 = ADC3 channel 10
+#define SFS_ADC_Y_CHANNEL 4     // PF6 = ADC3 channel 4
+
 // Bootloader protocol
 #define BOOTLOADER_CMD_GET_PROTOCOL_VERSION  0x00
 #define BOOTLOADER_CMD_SET_ADDRESS           0x01
@@ -991,6 +1007,122 @@ puppy_boot_sequence(void)
 }
 
 /****************************************************************
+ * Side Filament Sensors - ADC3 with analog mux (Prusa sandwich board)
+ *
+ * Hardware: 5 filament sensors multiplexed onto 2 ADC3 channels
+ * via 2 GPIO select pins. Matches Prusa XLBuddy hardware exactly.
+ *
+ * Mux positions (setA=PF12, setB=PG6):
+ *   pos 0 (A=0,B=0): X(PC0)=sfs1(T0), Y(PF6)=sfs2(T1)
+ *   pos 1 (A=1,B=0): X(PC0)=sfs3(T2), Y(PF6)=sfs4(unused)
+ *   pos 2 (A=0,B=1): X(PC0)=sfs5(T4), Y(PF6)=sfs6(T3)
+ ****************************************************************/
+
+// Side sensor latest readings (12-bit ADC, 0-4095)
+static uint16_t side_fs_values[5] = {0};
+
+static void side_fs_init(void)
+{
+    // Enable GPIO clocks for mux select and ADC pins
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIOFEN
+                   | RCC_AHB1ENR_GPIOGEN;
+    // Enable ADC3 clock (APB2)
+    RCC->APB2ENR |= RCC_APB2ENR_ADC3EN;
+    for (volatile int i = 0; i < 1000; i++) {}
+
+    // Configure mux select pins as push-pull outputs
+    // PF12 (setA)
+    SFS_MUX_A_PORT->MODER &= ~(3 << (SFS_MUX_A_PIN * 2));
+    SFS_MUX_A_PORT->MODER |= (1 << (SFS_MUX_A_PIN * 2));   // Output
+    SFS_MUX_A_PORT->OTYPER &= ~(1 << SFS_MUX_A_PIN);       // Push-pull
+    SFS_MUX_A_PORT->BSRR = (1 << (SFS_MUX_A_PIN + 16));    // Start LOW
+    // PG6 (setB)
+    SFS_MUX_B_PORT->MODER &= ~(3 << (SFS_MUX_B_PIN * 2));
+    SFS_MUX_B_PORT->MODER |= (1 << (SFS_MUX_B_PIN * 2));   // Output
+    SFS_MUX_B_PORT->OTYPER &= ~(1 << SFS_MUX_B_PIN);       // Push-pull
+    SFS_MUX_B_PORT->BSRR = (1 << (SFS_MUX_B_PIN + 16));    // Start LOW
+
+    // Configure ADC input pins as analog mode
+    // PC0 = ADC3_IN10
+    GPIOC->MODER |= (3 << (0 * 2));    // Analog mode (0b11)
+    // PF6 = ADC3_IN4
+    GPIOF->MODER |= (3 << (6 * 2));    // Analog mode (0b11)
+
+    // Configure ADC3
+    ADC3->CR1 = 0;                      // 12-bit resolution, no scan
+    ADC3->CR2 = ADC_CR2_ADON;           // Enable ADC
+    ADC3->SMPR1 = 0x07 << (0 * 3);     // CH10: 480 cycles sample time
+    ADC3->SMPR2 = 0x07 << (4 * 3);     // CH4: 480 cycles sample time
+    ADC3->SQR1 = 0;                     // 1 conversion in sequence
+}
+
+// Read a single ADC3 channel (blocking, ~15us)
+static uint16_t side_fs_read_channel(uint8_t channel)
+{
+    ADC3->SQR3 = channel;               // Select channel
+    ADC3->CR2 |= ADC_CR2_SWSTART;       // Start conversion
+    while (!(ADC3->SR & ADC_SR_EOC)) {}  // Wait for completion
+    return (uint16_t)(ADC3->DR & 0xFFF); // Read 12-bit result
+}
+
+// Set mux position and read both X and Y channels
+static void side_fs_read_mux_pos(uint8_t setA, uint8_t setB,
+                                  uint16_t *val_x, uint16_t *val_y)
+{
+    // Set mux select pins
+    if (setA)
+        SFS_MUX_A_PORT->BSRR = (1 << SFS_MUX_A_PIN);       // HIGH
+    else
+        SFS_MUX_A_PORT->BSRR = (1 << (SFS_MUX_A_PIN + 16)); // LOW
+    if (setB)
+        SFS_MUX_B_PORT->BSRR = (1 << SFS_MUX_B_PIN);       // HIGH
+    else
+        SFS_MUX_B_PORT->BSRR = (1 << (SFS_MUX_B_PIN + 16)); // LOW
+
+    // Wait for mux to settle (~10us)
+    for (volatile int i = 0; i < 200; i++) {}
+
+    // Read both channels
+    *val_x = side_fs_read_channel(SFS_ADC_X_CHANNEL);
+    *val_y = side_fs_read_channel(SFS_ADC_Y_CHANNEL);
+}
+
+// Read all 5 side filament sensors via mux cycling
+static void side_fs_read_all(void)
+{
+    uint16_t x, y;
+
+    // Pos 0 (A=0,B=0): X=sfs1(T0), Y=sfs5(T4)
+    side_fs_read_mux_pos(0, 0, &x, &y);
+    side_fs_values[0] = x;  // T0 = sfs1
+    side_fs_values[4] = y;  // T4 = sfs5
+
+    // Pos 1 (A=1,B=0): X=sfs2(T1), Y=sfs6(T3)
+    side_fs_read_mux_pos(1, 0, &x, &y);
+    side_fs_values[1] = x;  // T1 = sfs2
+    side_fs_values[3] = y;  // T3 = sfs6
+
+    // Pos 2 (A=0,B=1): X=sfs3(T2), Y=sandwich_temp(unused)
+    side_fs_read_mux_pos(0, 1, &x, &y);
+    side_fs_values[2] = x;  // T2 = sfs3
+
+    // Return mux to pos 0
+    SFS_MUX_A_PORT->BSRR = (1 << (SFS_MUX_A_PIN + 16));  // A=LOW
+    SFS_MUX_B_PORT->BSRR = (1 << (SFS_MUX_B_PIN + 16));  // B=LOW
+}
+
+// Klipper command: query all 5 side filament sensors
+void command_query_side_filament_sensors(uint32_t *args)
+{
+    side_fs_read_all();
+    sendf("side_filament_sensors_result s0=%u s1=%u s2=%u s3=%u s4=%u",
+          side_fs_values[0], side_fs_values[1], side_fs_values[2],
+          side_fs_values[3], side_fs_values[4]);
+}
+DECL_COMMAND(command_query_side_filament_sensors,
+             "query_side_filament_sensors");
+
+/****************************************************************
  * Early Init - Runs at MCU power-on before Klipper connects
  ****************************************************************/
 
@@ -1031,7 +1163,10 @@ modbus_early_init(void)
     
     // Small delay after enabling power
     for (volatile int i = 0; i < 10000; i++) {}
-    
+
+    // Initialize side filament sensor ADC3 + mux
+    side_fs_init();
+
     // Initialize hardware I2C2
     hw_i2c_init();
     
@@ -1615,3 +1750,162 @@ void loadcell_probe_task(void)
     loadcell_poll_fifo();
 }
 DECL_TASK(loadcell_probe_task);
+
+/****************************************************************
+ * Filament Sensor Endstop
+ *
+ * Reads tool filament sensor ADC (register 0x8063) via MODBUS
+ * FC 0x04 (read input registers) and triggers trsync when the
+ * ADC value crosses the midpoint threshold indicating filament
+ * is present. Used for autoload assist insertion.
+ *
+ * Modeled on loadcell endstop but much simpler - single register
+ * read instead of FIFO parsing.
+ ****************************************************************/
+
+// Poll interval: 50ms (20Hz) - filament detection doesn't need high speed
+#define FILAMENT_POLL_INTERVAL_US  50000
+
+static struct {
+    uint8_t dwarf_addr;          // MODBUS address of Dwarf to monitor
+    uint16_t threshold;          // ADC midpoint threshold
+    uint8_t ins_above;           // 1 if inserted value > nins value
+    uint16_t last_adc;           // Most recent ADC reading
+    uint8_t triggered;           // Has filament been detected
+    uint32_t trigger_time;       // MCU clock when triggered
+    uint8_t monitoring;          // Active monitoring flag
+    uint32_t last_poll_time;     // For rate limiting
+    uint32_t poll_count;         // Total polls performed
+    uint32_t poll_errors;        // MODBUS communication errors
+    uint8_t consec_detect;       // Consecutive "has_filament" readings
+    struct trsync *ts;           // trsync for endstop-style triggering
+    uint8_t trigger_reason;      // Reason code for trsync trigger
+    uint8_t homing;              // Currently in homing mode
+} filament_endstop = {0};
+
+// Read filament sensor register 0x8063 via FC 0x04
+static int filament_read_sensor(uint16_t *adc_out)
+{
+    // Build FC 0x04 (Read Input Registers) request for register 0x8063, count=1
+    uint8_t frame[8];
+    frame[0] = filament_endstop.dwarf_addr;
+    frame[1] = 0x04;  // FC: Read Input Registers
+    frame[2] = 0x80;  // Register high byte
+    frame[3] = 0x63;  // Register low byte
+    frame[4] = 0x00;  // Count high byte
+    frame[5] = 0x01;  // Count low byte
+    uint16_t crc = calc_crc16(frame, 6);
+    frame[6] = crc & 0xFF;
+    frame[7] = (crc >> 8) & 0xFF;
+
+    uint8_t response[32];
+    uint16_t resp_len = 0;
+
+    int ret = send_frame_wait(frame, 8, response, &resp_len,
+                              sizeof(response), MODBUS_RESPONSE_TIMEOUT_MS);
+
+    if (ret != MODBUS_OK || resp_len < 7) {
+        filament_endstop.poll_errors++;
+        return -1;
+    }
+
+    // FC 0x04 response: [addr][0x04][byte_count][data_hi][data_lo][CRC]
+    if (response[1] != 0x04 || response[2] != 2) {
+        filament_endstop.poll_errors++;
+        return -1;
+    }
+
+    *adc_out = (response[3] << 8) | response[4];
+    return 0;
+}
+
+// Setup filament sensor as endstop for homing_move
+void command_filament_endstop_home(uint32_t *args)
+{
+    filament_endstop.dwarf_addr = args[0];
+    filament_endstop.threshold = args[1];
+    filament_endstop.ins_above = args[2];
+
+    uint8_t trsync_oid = args[3];
+    uint8_t trigger_reason = args[4];
+
+    // Reset state
+    filament_endstop.triggered = 0;
+    filament_endstop.trigger_time = 0;
+    filament_endstop.last_adc = 0;
+    filament_endstop.poll_count = 0;
+    filament_endstop.poll_errors = 0;
+    filament_endstop.consec_detect = 0;
+    filament_endstop.last_poll_time = timer_read_time();
+
+    if (trsync_oid == 0xff) {
+        // Disable homing
+        filament_endstop.ts = NULL;
+        filament_endstop.homing = 0;
+        filament_endstop.monitoring = 0;
+    } else {
+        filament_endstop.ts = trsync_oid_lookup(trsync_oid);
+        filament_endstop.trigger_reason = trigger_reason;
+        filament_endstop.homing = 1;
+        filament_endstop.monitoring = 1;
+    }
+
+    sendf("filament_endstop_home_ack addr=%c threshold=%hu above=%c trsync=%c",
+          filament_endstop.dwarf_addr, filament_endstop.threshold,
+          filament_endstop.ins_above, trsync_oid);
+}
+DECL_COMMAND(command_filament_endstop_home,
+             "filament_endstop_home addr=%c threshold=%hu above=%c trsync_oid=%c trigger_reason=%c");
+
+// Filament sensor polling task
+void filament_sensor_task(void)
+{
+    if (!filament_endstop.monitoring)
+        return;
+
+    if (filament_endstop.triggered)
+        return;
+
+    // Rate limit polling
+    uint32_t now = timer_read_time();
+    if (now - filament_endstop.last_poll_time < timer_from_us(FILAMENT_POLL_INTERVAL_US))
+        return;
+    filament_endstop.last_poll_time = now;
+
+    // Read sensor
+    uint16_t adc = 0;
+    if (filament_read_sensor(&adc) != 0)
+        return;
+
+    filament_endstop.last_adc = adc;
+    filament_endstop.poll_count++;
+
+    // Check if filament detected: ADC crossed threshold
+    // ins_above=1: filament present when adc > threshold
+    // ins_above=0: filament present when adc < threshold
+    int detected = 0;
+    if (filament_endstop.ins_above) {
+        if (adc > filament_endstop.threshold)
+            detected = 1;
+    } else {
+        if (adc < filament_endstop.threshold)
+            detected = 1;
+    }
+
+    if (detected) {
+        filament_endstop.consec_detect++;
+        // Require 2 consecutive detections to filter noise
+        if (filament_endstop.consec_detect >= 2) {
+            filament_endstop.triggered = 1;
+            filament_endstop.trigger_time = now;
+            if (filament_endstop.homing && filament_endstop.ts) {
+                trsync_do_trigger(filament_endstop.ts,
+                                  filament_endstop.trigger_reason);
+                filament_endstop.homing = 0;  // One-shot
+            }
+        }
+    } else {
+        filament_endstop.consec_detect = 0;
+    }
+}
+DECL_TASK(filament_sensor_task);
