@@ -7154,19 +7154,23 @@ class PuppyBootloader:
             logging.error(f"PuppyBootloader: Failed to override TURN_OFF_HEATERS: {e}")
 
     def cmd_TURN_OFF_HEATERS(self, gcmd):
-        """Turn off ALL heaters - Klipper + all MODBUS dwarfs."""
+        """Turn off ALL heaters - Klipper + all MODBUS dwarfs + modular bed."""
         # Clear all stored targets so sync doesn't re-heat
         self.target_temps.clear()
         self._last_synced_temp = 0
         # Write 0 to all dwarfs
         for dwarf in self.booted_dwarfs:
             self._write_register(dwarf, 0xE000, 0)
+        # Turn off modular bed (all 16 bedlets)
+        if self.modular_bed_booted:
+            self.bed_global_target = 0.0
+            self._set_bedlet_temperatures(0.0)
         # Turn off Klipper heaters (extruder + bed)
         pheaters = self.printer.lookup_object('heaters', None)
         if pheaters is not None:
             for name, heater in pheaters.heaters.items():
                 heater.set_temp(0.)
-        self.gcode.respond_info("All heaters off (including MODBUS)")
+        self.gcode.respond_info("All heaters off (including MODBUS + bed)")
 
     def _override_m84(self):
         """Override Klipper's M84/M18 commands at klippy:ready time."""
