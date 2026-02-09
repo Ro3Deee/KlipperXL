@@ -1,16 +1,21 @@
-// Klipper MODBUS RTU Master for Prusa XL
+// XlKlipper - MODBUS RTU Master for Prusa XL
+// Copyright (C) 2026 Richard Crook
 //
-// Copyright (C) 2026 Richard & Claude
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
 //
-// This module implements MODBUS RTU master functionality using USART3 hardware
-// on the STM32F407 (XLBuddy board) to communicate with Dwarf toolheads via RS485.
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
 //
-// RS485 Configuration:
-//   USART3 TX: PD8, RX: PD9 (AF7)
-//   Direction: PG1 (HIGH=TX, LOW=RX)
-//   Baud: 230400, 8N1
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-// This file may be distributed under the terms of the GNU GPLv3 license.
+// MODBUS RTU master using USART3 on STM32F407 (XLBuddy board)
+// RS485: TX=PD8, RX=PD9 (AF7), Direction=PG1, 230400 baud 8N1
 
 #include <string.h>
 #include "autoconf.h"

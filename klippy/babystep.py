@@ -1,16 +1,21 @@
-# MCU-Level Z Babystep support for instant Z offset adjustment
+# XlKlipper - MCU-Level Z Babystep Support
+# Instant Z offset adjustment that bypasses Klipper's lookahead buffer
 #
-# This module sends commands directly to the babystep.c MCU code for
-# true instant Z adjustment that bypasses Klipper's lookahead buffer.
+# Copyright (C) 2026 Richard Crook
 #
-# Features:
-# - Instant Z adjustment (bypasses 1-2 sec lookahead buffer)
-# - Auto-saves offset to variables.cfg (survives restarts)
-# - Auto-loads saved offset on startup (like Prusa stock firmware)
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 #
-# Copyright (C) 2024
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
 #
-# This file may be distributed under the terms of the GNU GPLv3 license.
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 import logging
 
 SAVE_VARIABLE_NAME = "babystep_z_offset"

@@ -1,12 +1,20 @@
-// Real-time babystepping for Z-axis live adjustment.
+// XlKlipper - Real-time babystepping for Z-axis live adjustment
+// Immediate Z-axis micro-adjustments using existing stepper OIDs
 //
-// This module provides immediate Z-axis micro-adjustments using existing
-// stepper OIDs instead of configuring separate pins (which would conflict
-// with Klipper's pin reservation system).
+// Copyright (C) 2026 Richard Crook
 //
-// Copyright (C) 2024  Your Name
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
 //
-// This file may be distributed under the terms of the GNU GPLv3 license.
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "autoconf.h" // CONFIG_*
 #include "basecmd.h" // oid_lookup

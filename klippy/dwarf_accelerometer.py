@@ -1,15 +1,21 @@
-# =============================================================================
-# DWARF ACCELEROMETER SUPPORT (Fixed Version - 2026-02-01)
-# =============================================================================
+# XlKlipper - Dwarf Accelerometer Support for Prusa XL
 # LIS2DH12 accelerometer on each Dwarf toolhead, accessed via MODBUS FIFO
 # Used for input shaper calibration with Klipper resonance_tester
 #
-# FIXES APPLIED (from 5 specialist review):
-# 1. Pause temperature polling during accelerometer use (avoids bus contention)
-# 2. Use estimated_print_time for sample timestamps (not get_last_move_time)
-# 3. Add retry logic for FIFO reads (3 retries like Prusa)
-# 4. Drain FIFO until empty (multiple reads per poll cycle)
-# 5. Use puppy._send_frame() instead of separate command (avoids response routing conflicts)
+# Copyright (C) 2026 Richard Crook
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 # =============================================================================
 
 import collections

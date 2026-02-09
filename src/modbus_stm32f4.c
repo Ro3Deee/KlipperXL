@@ -1,11 +1,18 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Klipper MODBUS Master + Puppy Bootloader for Prusa XL
-// Copyright (C) 2026 Richard & Claude
+// XlKlipper - MODBUS Master + Puppy Bootloader for Prusa XL
+// Copyright (C) 2026 Richard Crook
 //
-// Complete implementation that:
-// 1. Releases Dwarfs from reset via PCA9557 I2C GPIO expander
-// 2. Sends bootloader commands to discover and start Dwarf apps
-// 3. Provides MODBUS communication for Klipper
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 // For STM32F407 (XLBuddy board)
 
