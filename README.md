@@ -7,6 +7,8 @@
 
 KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d.org/), giving you full control over your Prusa XL through Mainsail or Fluidd. All 5 Dwarf toolheads work via MODBUS communication with the XLBuddy mainboard.
 
+[![KlipperXL Printing](https://img.youtube.com/vi/xOmtuuXfN5g/0.jpg)](https://www.youtube.com/watch?v=xOmtuuXfN5g)
+
 ---
 
 ## Features
