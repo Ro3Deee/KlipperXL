@@ -34,7 +34,7 @@ KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d
 ### Motion & Calibration
 - **Input Shaper** - Resonance compensation via Dwarf accelerometers (per-tool measurement)
 - **Z Tilt Alignment** - Prusa-matched mechanical bed leveling
-- **Babystep Z** - Live Z offset adjustment during printing
+- **Z Offset (Live-Z)** - Adjusted in OrcaSlicer printer profile (z_offset), no firmware babystep needed
 
 ### Heater Management
 - **Multi-Tool Heater Preservation** - Parked tools maintain temperature via periodic MODBUS refresh
@@ -80,7 +80,7 @@ KlipperXL/
   docs/                      Technical documentation & installation guide
   config/                    Klipper configs (printer.cfg, macros, LEDs)
   klippy/                    Klipper Python extras (tool control, probing, MODBUS)
-  src/                       XLBuddy MCU firmware source (MODBUS + babystep)
+  src/                       XLBuddy MCU firmware source (MODBUS)
   firmware/                  Build config & recovery files
   orcaslicer/                Slicer profile and configuration guide
   scripts/                   Installation & fix scripts

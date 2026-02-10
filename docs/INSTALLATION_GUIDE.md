@@ -132,17 +132,11 @@ cd klipper
 ```bash
 # From the XlKlipper_Install_Package directory
 cp mcu_firmware/modbus_stm32f4.c ~/klipper/src/stm32/
-cp mcu_firmware/babystep.c ~/klipper/src/
 ```
 
 ### 4.2 Update Makefiles
 
 You need to add the custom source files to the build system:
-
-**Edit `~/klipper/src/Makefile`** - Add `babystep.c` to the source list:
-```
-src-y += babystep.c
-```
 
 **Edit `~/klipper/src/stm32/Makefile`** - Add `modbus_stm32f4.c` to the source list:
 ```
@@ -236,7 +230,6 @@ scp python_modules/loadcell_probe.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
 scp python_modules/pca9557.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
 scp python_modules/dwarf_accelerometer.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
 scp python_modules/modbus_master.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
-scp python_modules/babystep.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
 ```
 
 ---
@@ -320,19 +313,16 @@ klippy/extras/dwarf_accelerometer.py
 klippy/extras/loadcell_probe.py
 klippy/extras/modbus_master.py
 klippy/extras/pca9557.py
-klippy/extras/babystep.py
-src/babystep.c
 src/stm32/modbus_stm32f4.c
 .config_xlbuddy
 ```
 
 #### 2. Hide modifications to tracked files
 
-Our Makefile edits (adding babystep.c and modbus_stm32f4.c to the build) modify tracked files. We mark them as "assume-unchanged" so git ignores the modifications:
+Our Makefile edits (adding modbus_stm32f4.c to the build) modify tracked files. We mark them as "assume-unchanged" so git ignores the modifications:
 
 ```bash
 cd /home/pi/klipper
-git update-index --assume-unchanged src/Makefile
 git update-index --assume-unchanged src/stm32/Makefile
 ```
 
@@ -375,7 +365,6 @@ nano /home/pi/klipper/.git/info/exclude
 
 # 2. Mark Makefiles as unchanged
 cd /home/pi/klipper
-git update-index --assume-unchanged src/Makefile
 git update-index --assume-unchanged src/stm32/Makefile
 
 # 3. Clear Moonraker cache
@@ -691,7 +680,6 @@ Verify temperatures in Mainsail match expectations.
 | `pca9557.py` | I2C GPIO expander for Dwarf reset lines |
 | `dwarf_accelerometer.py` | Accelerometer for Input Shaper |
 | `modbus_master.py` | MODBUS communication layer |
-| `babystep.py` | Babystep Z offset support |
 
 ### Files on Pi (`/home/pi/printer_data/config/`)
 | File | Purpose |
@@ -706,7 +694,7 @@ Verify temperatures in Mainsail match expectations.
 ### Files Flashed to XLBuddy
 | File | Purpose |
 |------|---------|
-| `klipper.bin` | Klipper MCU firmware with MODBUS + babystep support |
+| `klipper.bin` | Klipper MCU firmware with MODBUS support |
 
 ---
 

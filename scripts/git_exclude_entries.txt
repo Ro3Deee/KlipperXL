@@ -10,8 +10,6 @@ klippy/extras/led_effect.py
 klippy/extras/loadcell_probe.py
 klippy/extras/modbus_master.py
 klippy/extras/pca9557.py
-klippy/extras/babystep.py
-src/babystep.c
 src/modbus_stm32f4.c
 src/stm32/modbus_stm32f4.c
 .config_xlbuddy

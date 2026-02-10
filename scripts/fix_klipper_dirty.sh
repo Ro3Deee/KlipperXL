@@ -45,8 +45,6 @@ klippy/extras/led_effect.py
 klippy/extras/loadcell_probe.py
 klippy/extras/modbus_master.py
 klippy/extras/pca9557.py
-klippy/extras/babystep.py
-src/babystep.c
 src/modbus_stm32f4.c
 src/stm32/modbus_stm32f4.c
 .config_xlbuddy
@@ -60,8 +58,7 @@ echo ""
 echo "Step 2: Marking modified Makefiles as assume-unchanged..."
 cd "$KLIPPER_DIR"
 
-# These are tracked files we modified to add babystep.c and modbus_stm32f4.c to the build
-git update-index --assume-unchanged src/Makefile 2>/dev/null && echo "  src/Makefile marked" || echo "  src/Makefile not found (OK)"
+# These are tracked files we modified to add modbus_stm32f4.c to the build
 git update-index --assume-unchanged src/stm32/Makefile 2>/dev/null && echo "  src/stm32/Makefile marked" || echo "  src/stm32/Makefile not found (OK)"
 
 # Step 3: Clear Moonraker's cached dirty state
