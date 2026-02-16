@@ -1772,6 +1772,8 @@ class PuppyBootloader:
 
         # Dock calibration state
         self.dock_cal_active = False
+        # Guard against recursive G28 during tool pick (homing override calls T0)
+        self._in_auto_home = False
 
         # Register config callback for MCU setup
         self.mcu.register_config_callback(self._build_config)
@@ -4748,12 +4750,21 @@ class PuppyBootloader:
                 if new_dwarf in self.booted_dwarfs:
                     self._poll_dwarf_for_sensor(new_dwarf)
 
-                # Wait for tool to reach its TARGET temp if it's cold
-                if new_tool_target > 0:
-                    current_temp = self.dwarf_data.get(new_dwarf, {}).get('hotend_temp', 0)
-                    if current_temp < (new_tool_target - 5):  # 5C tolerance
-                        self.gcode.respond_info(f"T{physical_tool} at {current_temp}C - waiting for target {new_tool_target}C...")
-                        self._wait_for_tool_temp(new_dwarf, new_tool_target, tolerance=5.0)
+                # NOTE: Temperature wait removed — slicer's M109 handles this without
+                # starving the MODBUS poll timer.
+
+                # CRITICAL: Force sensor to push temperature to heater IMMEDIATELY.
+                # Same fix as cmd_TOOL_PICK — without this, quick changes can hit
+                # "Extrude below minimum temp" if slicer extrudes within 1 second.
+                if self._extruder_heater is not None:
+                    sensor = getattr(self._extruder_heater, 'sensor', None)
+                    if sensor is not None and hasattr(sensor, '_sample_temperature'):
+                        sensor._sample_temperature(self.reactor.monotonic())
+                    with self._extruder_heater.lock:
+                        actual_temp = self._extruder_heater.last_temp
+                        if actual_temp >= self._extruder_heater.min_extrude_temp:
+                            self._extruder_heater.smoothed_temp = actual_temp
+                            self._extruder_heater.can_extrude = True
 
                 self._last_synced_temp = 0  # Force re-sync
 
@@ -6648,8 +6659,27 @@ class PuppyBootloader:
         if dwarf not in self.booted_dwarfs:
             raise gcmd.error(f"Tool {tool} (Dwarf {dwarf}) not available")
         if self.tool_picked:
-            raise gcmd.error(
-                f"Tool T{self.active_tool} is already picked! Park it first.")
+            # Verify with Hall sensor — tool may have been manually removed
+            active_dwarf = self.active_tool + 1
+            state = self._get_dock_state(active_dwarf)
+            if state:
+                is_picked, is_parked = state
+                if not is_picked:
+                    # Tool was manually removed — clear stale software state
+                    self.gcode.respond_info(
+                        f"T{self.active_tool} not on carriage (manually removed?) "
+                        f"- clearing stale state")
+                    self.tool_picked = False
+                    self.active_tool = -1
+                    self.gcode.run_script_from_command(
+                        "SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0")
+                    self.applied_tool_offset = (0.0, 0.0, 0.0)
+                else:
+                    raise gcmd.error(
+                        f"Tool T{self.active_tool} is already picked! Park it first.")
+            else:
+                raise gcmd.error(
+                    f"Tool T{self.active_tool} is already picked! Park it first.")
 
         # SAFETY: Physical Hall sensor check - verify no tool on carriage
         # This catches cases where software state is wrong (e.g., after restart)
@@ -6666,14 +6696,39 @@ class PuppyBootloader:
                         f"SAFETY: Hall sensor detects T{check_tool} is physically picked! "
                         f"Park it first or verify correct tool state.")
 
-        # Auto-home if needed before tool change
+        # Auto-home if needed before tool change.
+        # Uses full G28 so Z is properly homed via T0's loadcell.
+        # The _in_auto_home guard prevents infinite recursion:
+        # G28 homing_override → T0 → cmd_TOOL_PICK(T=0) → would G28 again.
         toolhead = self.printer.lookup_object('toolhead')
         curtime = self.reactor.monotonic()
         kin_status = toolhead.get_status(curtime)
         homed = kin_status.get('homed_axes', '')
-        if 'x' not in homed or 'y' not in homed or 'z' not in homed:
-            self.gcode.respond_info("Axes not homed - homing all first...")
-            self.gcode.run_script_from_command("G28")
+        needs_home = 'x' not in homed or 'y' not in homed or 'z' not in homed
+        if needs_home and not self._in_auto_home:
+            self._in_auto_home = True
+            try:
+                self.gcode.respond_info("Axes not homed - homing all axes...")
+                self.gcode.run_script_from_command("G28")
+            finally:
+                self._in_auto_home = False
+            # G28's homing_override picked T0 for loadcell Z probing.
+            if self.tool_picked and self.active_tool == tool:
+                # Requested tool IS T0 — already picked during homing.
+                # Offsets were applied during the inner cmd_TOOL_PICK.
+                self.gcode.respond_info(
+                    f"T{tool} already picked during homing - done")
+                return
+            elif self.tool_picked:
+                # Different tool requested — park T0 first, then pick below.
+                self.gcode.respond_info(
+                    f"Parking T{self.active_tool} (picked during homing) "
+                    f"before picking T{tool}")
+                self.gcode.run_script_from_command("TOOL_PARK")
+        elif needs_home and self._in_auto_home:
+            # Recursive call from homing_override's T0 — skip auto-home.
+            # XY is already homed, Z will be homed after this T0 pick.
+            pass
 
         # ============================================================
         # PRUSA-STYLE Z OFFSET COMPENSATION (from toolchanger.cpp)
@@ -6749,12 +6804,18 @@ class PuppyBootloader:
         self._move_xy(y=dock_y, speed=self.SLOW_SPEED)
         self._wait_for_moves()
 
-        # Wait for is_picked
+        # Wait for is_picked (retry if MODBUS bus is congested)
         self.reactor.pause(self.reactor.monotonic() + 0.3)
-        state = self._get_dock_state(dwarf)
         picked = False
-        if state:
-            picked, parked = state
+        for attempt in range(5):
+            state = self._get_dock_state(dwarf)
+            if state:
+                picked, parked = state
+                break
+            # MODBUS read failed — bus congested, wait and retry
+            self.gcode.respond_info(
+                f"Hall sensor read failed, retrying ({attempt+1}/5)...")
+            self.reactor.pause(self.reactor.monotonic() + 0.5)
         if not picked:
             # Wiggle - push DEEPER into dock (Prusa: dock_y + DOCK_WIGGLE_OFFSET)
             self.gcode.respond_info("Not picked, wiggling...")
@@ -6763,9 +6824,15 @@ class PuppyBootloader:
             self._move_xy(y=dock_y, speed=self.SLOW_SPEED)
             self._wait_for_moves()
             self.reactor.pause(self.reactor.monotonic() + 0.3)
-            state = self._get_dock_state(dwarf)
-            if state:
-                picked, parked = state
+            picked = False
+            for attempt in range(5):
+                state = self._get_dock_state(dwarf)
+                if state:
+                    picked, parked = state
+                    break
+                self.gcode.respond_info(
+                    f"Hall sensor read failed after wiggle, retrying ({attempt+1}/5)...")
+                self.reactor.pause(self.reactor.monotonic() + 0.5)
             if not picked:
                 raise gcmd.error(
                     f"T{tool} not detected as picked after wiggle!")
@@ -6927,14 +6994,43 @@ class PuppyBootloader:
         # The slicer handles priming at the wipe tower via generated G-code.
         # Adding prime here caused "Extrude below minimum temp" errors.
 
-        # Wait for tool to reach its TARGET temp if it's cold
-        # This is required for: first tool change, cold tools, or after standby cooling
-        # Only wait if tool is below target (saves time if already hot)
-        if new_tool_target > 0:
-            current_temp = self.dwarf_data.get(dwarf, {}).get('hotend_temp', 0)
-            if current_temp < (new_tool_target - 5):  # 5C tolerance
-                self.gcode.respond_info(f"T{tool} at {current_temp}C - waiting for target {new_tool_target}C...")
-                self._wait_for_tool_temp(dwarf, new_tool_target, tolerance=5.0)
+        # NOTE: Temperature wait removed — the slicer's M109 handles this correctly
+        # without starving the MODBUS poll timer. _wait_for_tool_temp was pausing
+        # the poll timer for up to 120s, causing other Dwarfs to lose their watchdog
+        # and reset (blue LEDs), which then caused pick failures.
+
+        # CRITICAL: Poll active tool one final time before returning to slicer.
+        # After temp wait + round-robin polling delays, the sensor data can go
+        # stale, causing "Extrude below minimum temp" on the first extrude command.
+        if not self._poll_dwarf_for_sensor(dwarf):
+            logging.warning(f"PuppyBootloader: Final sensor poll failed for Dwarf {dwarf} "
+                          f"- extrusion may be blocked until next successful poll")
+
+        # CRITICAL: Force sensor to push temperature to heater IMMEDIATELY.
+        # _poll_dwarf_for_sensor updates dwarf_data, but the DwarfTemperatureSensor
+        # callback only fires every 1 second. If the slicer sends an extrude move
+        # within that gap, the heater's smoothed_temp is still 0°C and can_extrude
+        # is False, causing "Extrude below minimum temp". By calling _sample_temperature
+        # directly, we push the real temp (e.g. 218°C) through to the heater now.
+        if self._extruder_heater is not None:
+            sensor = getattr(self._extruder_heater, 'sensor', None)
+            if sensor is not None and hasattr(sensor, '_sample_temperature'):
+                sensor._sample_temperature(self.reactor.monotonic())
+            # CRITICAL: Bypass Klipper's smoothing filter after tool change.
+            # During TOOL_PARK, active_tool=-1 causes the sensor to report 0°C.
+            # Klipper's EMA filter (smooth_time=1.0) slams smoothed_temp to 0
+            # in one callback. The forced _sample_temperature above pushes the
+            # real temp, but if the last 0°C callback was recent (<0.78s ago),
+            # adj_time is too small and smoothed_temp only partially recovers
+            # (e.g. 65°C — still below min_extrude_temp of 170°C).
+            # Prusa avoids this entirely — no smoothing filter, per-tool temp
+            # arrays, all Dwarfs polled continuously. We match that behavior by
+            # directly setting smoothed_temp to the MODBUS-confirmed real temp.
+            with self._extruder_heater.lock:
+                actual_temp = self._extruder_heater.last_temp
+                if actual_temp >= self._extruder_heater.min_extrude_temp:
+                    self._extruder_heater.smoothed_temp = actual_temp
+                    self._extruder_heater.can_extrude = True
 
         # Reset sync state so next poll will use new tool
         self._last_synced_temp = 0
@@ -6992,11 +7088,7 @@ class PuppyBootloader:
                 f"Swapping: parking T{from_tool}, picking T{to_tool}...")
             self.gcode.run_script_from_command("TOOL_PARK")
             self.gcode.run_script_from_command(f"TOOL_PICK T={to_tool}")
-            # Wait for new tool to reach temp
-            if old_target > 0:
-                self.gcode.respond_info(
-                    f"Waiting for T{to_tool} to reach {old_target}C...")
-                self._wait_for_tool_temp(to_dwarf, old_target, tolerance=5.0)
+            # NOTE: Temperature wait removed — slicer's M109 handles this
             self.gcode.respond_info(
                 f"Spool join complete. T{to_tool} ready. Resume print.")
         else:
@@ -7028,14 +7120,37 @@ class PuppyBootloader:
         if not self.tool_picked or self.active_tool < 0:
             raise gcmd.error("No tool is currently picked!")
 
-        # Auto-home if needed before tool change
+        # Verify with Hall sensor — tool may have been manually removed
+        active_dwarf = self.active_tool + 1
+        state = self._get_dock_state(active_dwarf)
+        if state:
+            is_picked, is_parked = state
+            if not is_picked:
+                self.gcode.respond_info(
+                    f"T{self.active_tool} not on carriage (manually removed?) "
+                    f"- clearing state, skipping park")
+                self.tool_picked = False
+                self.active_tool = -1
+                self.gcode.run_script_from_command(
+                    "SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0")
+                self.applied_tool_offset = (0.0, 0.0, 0.0)
+                return
+
+        # Auto-home XY if needed before park.
+        # XY-only because full G28 requires T0 for Z homing — but a different
+        # tool may be on the carriage. G28 would try to park it and pick T0,
+        # breaking the park sequence. For Z, lower the bed 20mm for clearance.
         toolhead = self.printer.lookup_object('toolhead')
         curtime = self.reactor.monotonic()
         kin_status = toolhead.get_status(curtime)
         homed = kin_status.get('homed_axes', '')
-        if 'x' not in homed or 'y' not in homed or 'z' not in homed:
-            self.gcode.respond_info("Axes not homed - homing all first...")
-            self.gcode.run_script_from_command("G28")
+        if 'x' not in homed or 'y' not in homed:
+            self.gcode.respond_info("XY not homed - homing X Y first...")
+            self.gcode.run_script_from_command("G28 X Y")
+        if 'z' not in homed:
+            self.gcode.run_script_from_command("SET_KINEMATIC_POSITION Z=0")
+            self.gcode.run_script_from_command("G1 Z20 F600")
+            toolhead.wait_moves()
 
         # Z safety check - ensure bed is at safe height before tool change
         cur_pos = toolhead.get_position()
@@ -7125,12 +7240,17 @@ class PuppyBootloader:
         self._move_xy(x=dock_x, y=dock_y, speed=self.SLOW_SPEED)
         self._wait_for_moves()
 
-        # Wait for is_parked
+        # Wait for is_parked (retry if MODBUS bus is congested)
         self.reactor.pause(self.reactor.monotonic() + 0.3)
-        state = self._get_dock_state(dwarf)
         parked = False
-        if state:
-            picked, parked = state
+        for attempt in range(5):
+            state = self._get_dock_state(dwarf)
+            if state:
+                picked, parked = state
+                break
+            self.gcode.respond_info(
+                f"Hall sensor read failed, retrying ({attempt+1}/5)...")
+            self.reactor.pause(self.reactor.monotonic() + 0.5)
         if not parked:
             # Wiggle
             self.gcode.respond_info("Not parked, wiggling...")
@@ -7139,9 +7259,15 @@ class PuppyBootloader:
             self._move_xy(x=dock_x, speed=self.SLOW_SPEED)
             self._wait_for_moves()
             self.reactor.pause(self.reactor.monotonic() + 0.3)
-            state = self._get_dock_state(dwarf)
-            if state:
-                picked, parked = state
+            parked = False
+            for attempt in range(5):
+                state = self._get_dock_state(dwarf)
+                if state:
+                    picked, parked = state
+                    break
+                self.gcode.respond_info(
+                    f"Hall sensor read failed after wiggle, retrying ({attempt+1}/5)...")
+                self.reactor.pause(self.reactor.monotonic() + 0.5)
             if not parked:
                 raise gcmd.error(
                     f"T{tool} not reporting parked after insert!")
@@ -8287,9 +8413,10 @@ class DwarfTemperatureSensor:
         dwarf: 0     - Dynamic: read from active tool's Dwarf (active_tool + 1)
     """
 
-    STALE_TIMEOUT = 10.0  # Seconds before temp data is considered stale
+    STALE_TIMEOUT = 30.0  # Seconds before temp data is considered stale
     # Note: With 5 Dwarfs, poll_interval=5s, and 0.5s inter-Dwarf gaps,
-    # each Dwarf is polled every ~7.5s. Timeout must exceed this.
+    # each Dwarf is polled every ~7.5s. 30s matches watchdog timeout.
+    # Thermal safety is handled by Dwarf firmware at 100ms intervals.
 
     def __init__(self, config):
         self.config = config  # Store config for _load_tool_offsets
@@ -8393,7 +8520,8 @@ class DwarfTemperatureSensor:
                               f"bogus reading {temp_val}C - ignoring")
             else:
                 self.temp = temp_val
-            # Update our tracking time from when polling actually occurred
+            # Always refresh staleness timer when poll data exists,
+            # even on garbage readings — prevents false stale shutdowns
             if poll_time > 0:
                 self._last_update_time = poll_time
         else:
