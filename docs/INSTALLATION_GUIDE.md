@@ -133,29 +133,50 @@ cd klipper
 
 ## 4. Build Klipper MCU Firmware
 
-### 4.1 Copy Custom Modules to Klipper Source
+### 4.1 Copy Custom MODBUS Module to Klipper Source
 
 ```bash
-# From the KlipperXL directory
-cp ~/KlipperXL/src/modbus_stm32f4.c ~/klipper/src/stm32/
+cp ~/KlipperXL/src/modbus_stm32f4.c ~/klipper/src/
 ```
 
-### 4.2 Update Makefiles
+### 4.2 Update Makefile
 
-You need to add the custom source files to the build system:
-
-**Edit `~/klipper/src/stm32/Makefile`** - Add `modbus_stm32f4.c` to the source list:
-```
-src-y += stm32/modbus_stm32f4.c
-```
-
-### 4.3 Copy Klipper Build Configuration
+Edit the STM32 Makefile to include the MODBUS module:
 
 ```bash
-cp ~/KlipperXL/firmware/klipper_config ~/klipper/.config
+nano ~/klipper/src/stm32/Makefile
 ```
 
-The config targets STM32F407 (XLBuddy), 12MHz crystal, no bootloader, USB serial.
+Find the line:
+```
+src-$(CONFIG_MACH_STM32F4) += stm32/stm32f4.c ../lib/stm32f4/system_stm32f4xx.c
+```
+
+Add this line directly below it:
+```
+src-$(CONFIG_MACH_STM32F4) += modbus_stm32f4.c
+```
+
+Save and exit (`Ctrl+O`, Enter, `Ctrl+X`).
+
+### 4.3 Configure the Build
+
+Run `make menuconfig` to configure for the XLBuddy board:
+
+```bash
+cd ~/klipper
+make menuconfig
+```
+
+Set these options:
+- **Micro-controller Architecture:** STMicroelectronics STM32
+- **Processor model:** STM32F407
+- **Bootloader offset:** No bootloader
+- **Clock Reference:** 12 MHz crystal
+- **Communication interface:** USB (on PA11/PA12)
+- **USB ids:** 0x1d50 / 0x614e
+
+Save and exit.
 
 ### 4.4 Build the Firmware
 
@@ -165,7 +186,8 @@ make clean
 make -j4
 ```
 
-This creates `~/klipper/out/klipper.bin`
+You should see `Compiling out/src/modbus_stm32f4.o` in the output.
+A few warnings about unused functions are normal. This creates `~/klipper/out/klipper.bin`
 
 ---
 
@@ -178,12 +200,12 @@ This creates `~/klipper/out/klipper.bin`
 1. **Power OFF** the printer completely
 2. Locate the **BOOT0 jumper** on the XLBuddy board
 3. **Install the jumper** to enable DFU mode
-4. **Power ON** the printer
+4. **Power ON** the printer (connect USB to Pi)
 5. The XLBuddy is now in DFU mode (no display activity is normal)
 
 ### 5.2 Flash via DFU
 
-SSH to your Pi and run:
+On the Pi:
 
 ```bash
 # Install dfu-util if not present
@@ -195,16 +217,9 @@ sudo dfu-util -l
 
 You should see a device with `Internal Flash` listed.
 
-Copy the firmware to the Pi:
-```bash
-# From your build computer
-scp ~/klipper/out/klipper.bin pi@<PI_IP>:/tmp/klipper.bin
-```
-
 Flash the firmware:
 ```bash
-# On the Pi
-sudo dfu-util -a 0 -s 0x08000000:leave -D /tmp/klipper.bin
+sudo dfu-util -a 0 -s 0x08000000:leave -D ~/klipper/out/klipper.bin
 ```
 
 ### 5.3 Exit DFU Mode
@@ -225,17 +240,15 @@ You should see something like: `usb-Klipper_stm32f407xx_...`
 
 ## 6. Deploy Python Modules
 
-Copy all Python extras to the Pi's Klipper installation:
+Copy all Python extras to Klipper:
 
 ```bash
-# From the KlipperXL directory
-PI_IP="<PI_IP>"  # Change to your Pi's IP
-
-scp ~/KlipperXL/klippy/puppy_bootloader.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
-scp ~/KlipperXL/klippy/loadcell_probe.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
-scp ~/KlipperXL/klippy/pca9557.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
-scp ~/KlipperXL/klippy/dwarf_accelerometer.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
-scp ~/KlipperXL/klippy/modbus_master.py pi@${PI_IP}:/home/pi/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/puppy_bootloader.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/loadcell_probe.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/pca9557.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/dwarf_accelerometer.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/modbus_master.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/tool_offsets.py ~/klipper/klippy/extras/
 ```
 
 ---
@@ -245,21 +258,18 @@ scp ~/KlipperXL/klippy/modbus_master.py pi@${PI_IP}:/home/pi/klipper/klippy/extr
 ### 7.1 Copy Configuration Files
 
 ```bash
-# From the KlipperXL directory
-PI_IP="<PI_IP>"  # Change to your Pi's IP
-
 # Main printer.cfg
-scp ~/KlipperXL/config/printer.cfg pi@${PI_IP}:~/printer_data/config/printer.cfg
+cp ~/KlipperXL/config/printer.cfg ~/printer_data/config/printer.cfg
 
 # Tool offsets (will need recalibration for your machine)
-scp ~/KlipperXL/config/tool_offsets.cfg pi@${PI_IP}:~/printer_data/config/tool_offsets.cfg
+cp ~/KlipperXL/config/tool_offsets.cfg ~/printer_data/config/tool_offsets.cfg
 
 # Variables file
-scp ~/KlipperXL/config/variables.cfg pi@${PI_IP}:~/printer_data/config/variables.cfg
+cp ~/KlipperXL/config/variables.cfg ~/printer_data/config/variables.cfg
 
 # Create macros directory and copy macros
-ssh pi@${PI_IP} "mkdir -p ~/printer_data/config/macros"
-scp ~/KlipperXL/config/macros/print_macros.cfg pi@${PI_IP}:~/printer_data/config/macros/print_macros.cfg
+mkdir -p ~/printer_data/config/macros
+cp ~/KlipperXL/config/macros/print_macros.cfg ~/printer_data/config/macros/print_macros.cfg
 ```
 
 ### 7.2 Update Serial Port in printer.cfg
