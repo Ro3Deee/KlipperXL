@@ -36,6 +36,10 @@ if [ ! -d "$HOME/klippy-env" ]; then
     MISSING="$MISSING\n  - ~/klippy-env (Klipper Python environment not found)"
 fi
 
+if ! command -v cpp &>/dev/null; then
+    MISSING="$MISSING\n  - cpp (C preprocessor not found — install build-essential)"
+fi
+
 if ! command -v arm-none-eabi-gcc &>/dev/null; then
     MISSING="$MISSING\n  - arm-none-eabi-gcc (ARM build toolchain not found)"
 fi
@@ -53,6 +57,9 @@ if [ -n "$MISSING" ]; then
     echo "  ./kiauh/kiauh.sh"
     echo ""
     echo "Install Klipper, Moonraker, and Mainsail, then re-run this script."
+    echo ""
+    echo "For build tools, run:"
+    echo "  sudo apt install build-essential gcc-arm-none-eabi"
     exit 1
 fi
 

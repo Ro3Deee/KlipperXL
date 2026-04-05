@@ -36,9 +36,15 @@ Complete step-by-step guide to install KlipperXL on a Prusa XL with XLBuddy boar
 
 ### Software Required (on your build computer)
 - Git
-- ARM GCC toolchain (`arm-none-eabi-gcc`)
+- Build tools (`build-essential` — provides `gcc`, `cpp`, `make`)
+- ARM GCC toolchain (`gcc-arm-none-eabi`)
 - Python 3.8+
 - SSH client
+
+Install build dependencies:
+```bash
+sudo apt install build-essential gcc-arm-none-eabi
+```
 
 ### Knowledge Required
 - Basic Linux command line
@@ -625,6 +631,13 @@ Verify temperatures in Mainsail match expectations.
 ---
 
 ## 12. Troubleshooting
+
+### "make: cpp: No such file or directory" during firmware build
+- Missing host C preprocessor — install build tools:
+  ```bash
+  sudo apt install build-essential gcc-arm-none-eabi
+  ```
+- Then retry: `make clean && make -j4`
 
 ### "MCU 'mcu' shutdown: Timer too close"
 - The MCU firmware wasn't flashed correctly
