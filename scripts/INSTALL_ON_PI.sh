@@ -74,12 +74,11 @@ echo "[2/5] Installing MODBUS module..."
 
 # Determine where our module files are
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODULE_DIR="$(dirname "$SCRIPT_DIR")"
 
-if [ -f "$SCRIPT_DIR/src/modbus_stm32f4.c" ]; then
-    MODULE_DIR="$SCRIPT_DIR"
-else
-    echo "ERROR: Cannot find modbus_stm32f4.c"
-    echo "Make sure you're running this from the klipper-modbus-module directory"
+if [ ! -f "$MODULE_DIR/src/modbus_stm32f4.c" ]; then
+    echo "ERROR: Cannot find src/modbus_stm32f4.c in $MODULE_DIR"
+    echo "Make sure you're running this from the KlipperXL directory"
     exit 1
 fi
 
