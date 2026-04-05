@@ -2,7 +2,7 @@
 
 Complete step-by-step guide to install KlipperXL on a Prusa XL with XLBuddy board.
 
-**Last Updated:** 2026-02-09
+**Last Updated:** 2026-04-05
 **Tested Configuration:** Prusa XL 5-tool with XLBuddy mainboard
 
 ---
@@ -11,16 +11,15 @@ Complete step-by-step guide to install KlipperXL on a Prusa XL with XLBuddy boar
 
 1. [Prerequisites](#1-prerequisites)
 2. [Raspberry Pi Setup](#2-raspberry-pi-setup)
-3. [Extract KlipperXL Package](#3-extract-xlklipper-package)
-4. [Build Klipper MCU Firmware](#4-build-klipper-mcu-firmware)
-5. [Flash XLBuddy MCU](#5-flash-xlbuddy-mcu)
-6. [Deploy Python Modules](#6-deploy-python-modules)
-7. [Deploy Configuration Files](#7-deploy-configuration-files)
-8. [Fix Klipper Update Manager (Dirty State)](#8-fix-klipper-update-manager-dirty-state)
-9. [Optional: LED Strips and Webcam](#9-optional-led-strips-and-webcam)
-10. [Configure OrcaSlicer](#10-configure-orcaslicer)
-11. [First Boot and Calibration](#11-first-boot-and-calibration)
-12. [Troubleshooting](#12-troubleshooting)
+3. [Clone KlipperXL and Build Firmware](#3-clone-klipperxl-and-build-firmware)
+4. [Deploy Python Modules](#4-deploy-python-modules)
+5. [Deploy Configuration Files](#5-deploy-configuration-files)
+6. [Flash XLBuddy MCU](#6-flash-xlbuddy-mcu)
+7. [Fix Klipper Update Manager (Dirty State)](#7-fix-klipper-update-manager-dirty-state)
+8. [Optional: LED Strips and Webcam](#8-optional-led-strips-and-webcam)
+9. [Configure OrcaSlicer](#9-configure-orcaslicer)
+10. [First Boot and Calibration](#10-first-boot-and-calibration)
+11. [Troubleshooting](#11-troubleshooting)
 
 ---
 
@@ -32,19 +31,9 @@ Complete step-by-step guide to install KlipperXL on a Prusa XL with XLBuddy boar
 - MicroSD card (16GB+)
 - USB cable (USB-A to USB-C for XLBuddy connection)
 - Ethernet or WiFi connection for Pi
-- Computer with WSL/Linux for building firmware
 
-### Software Required (on your build computer)
-- Git
-- Build tools (`build-essential` — provides `gcc`, `cpp`, `make`)
-- ARM GCC toolchain (`gcc-arm-none-eabi`)
-- Python 3.8+
-- SSH client
-
-Install build dependencies:
-```bash
-sudo apt install build-essential gcc-arm-none-eabi
-```
+### Software Required
+Everything is built directly on the Raspberry Pi — no separate build computer needed.
 
 ### Knowledge Required
 - Basic Linux command line
@@ -66,51 +55,57 @@ sudo apt install build-essential gcc-arm-none-eabi
    - WiFi (optional)
    - Enable SSH
 
-### 2.2 Install KIAUH (Klipper Installation And Update Helper)
+### 2.2 First Boot and Updates
 
 SSH into your Pi and run:
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install git -y
+```
 
+### 2.3 Install Build Tools
+
+```bash
+sudo apt install git build-essential gcc-arm-none-eabi -y
+```
+
+### 2.4 Install KIAUH (Klipper Installation And Update Helper)
+
+```bash
 cd ~
 git clone https://github.com/dw-0/kiauh.git
 ./kiauh/kiauh.sh
 ```
 
-### 2.3 Install Klipper Components via KIAUH
+### 2.5 Install Klipper Components via KIAUH
 
 From the KIAUH menu, install:
 1. **Klipper** (option 1)
 2. **Moonraker** (option 2)
-3. **Mainsail** (option 3)
+3. **Mainsail** or **Fluidd** (option 3 or 4 — your preference)
+
+If prompted to add your user to the `tty` group, answer **Y**.
 
 After installation, verify Klipper service:
 ```bash
 sudo systemctl status klipper
 ```
 
-### 2.4 Note Your Pi's IP Address
+### 2.6 Note Your Pi's IP Address
 
 ```bash
 hostname -I
 ```
 
-Example: `<YOUR_PI_IP>`
-
 ---
 
-## 3. Clone KlipperXL and Klipper
-
-On your **build computer** (WSL/Linux), not the Pi:
+## 3. Clone KlipperXL and Build Firmware
 
 ### 3.1 Clone the KlipperXL Repository
 
 ```bash
 cd ~
 git clone https://github.com/racoutlaw/KlipperXL.git
-cd KlipperXL
 ```
 
 You should see these folders:
@@ -121,25 +116,13 @@ You should see these folders:
 - `firmware/` - Build config and recovery files
 - `orcaslicer/` - Slicer profiles
 
-### 3.2 Clone Klipper Source (needed for building firmware)
-
-```bash
-cd ~
-git clone https://github.com/Klipper3d/klipper.git
-cd klipper
-```
-
----
-
-## 4. Build Klipper MCU Firmware
-
-### 4.1 Copy Custom MODBUS Module to Klipper Source
+### 3.2 Copy Custom MODBUS Module to Klipper Source
 
 ```bash
 cp ~/KlipperXL/src/modbus_stm32f4.c ~/klipper/src/
 ```
 
-### 4.2 Update Makefile
+### 3.3 Update Makefile
 
 Edit the STM32 Makefile to include the MODBUS module:
 
@@ -159,7 +142,7 @@ src-$(CONFIG_MACH_STM32F4) += modbus_stm32f4.c
 
 Save and exit (`Ctrl+O`, Enter, `Ctrl+X`).
 
-### 4.3 Configure the Build
+### 3.4 Configure the Build
 
 Run `make menuconfig` to configure for the XLBuddy board:
 
@@ -178,7 +161,7 @@ Set these options:
 
 Save and exit.
 
-### 4.4 Build the Firmware
+### 3.5 Build the Firmware
 
 ```bash
 cd ~/klipper
@@ -191,19 +174,60 @@ A few warnings about unused functions are normal. This creates `~/klipper/out/kl
 
 ---
 
-## 5. Flash XLBuddy MCU
+## 4. Deploy Python Modules
 
-### 5.1 Enter DFU Mode
+Copy all Python extras to Klipper:
+
+```bash
+cp ~/KlipperXL/klippy/puppy_bootloader.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/loadcell_probe.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/pca9557.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/dwarf_accelerometer.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/modbus_master.py ~/klipper/klippy/extras/
+cp ~/KlipperXL/klippy/tool_offsets.py ~/klipper/klippy/extras/
+```
+
+---
+
+## 5. Deploy Configuration Files
+
+### 5.1 Copy Configuration Files
+
+```bash
+# Main printer.cfg
+cp ~/KlipperXL/config/printer.cfg ~/printer_data/config/printer.cfg
+
+# Tool offsets (will need recalibration for your machine)
+cp ~/KlipperXL/config/tool_offsets.cfg ~/printer_data/config/tool_offsets.cfg
+
+# Variables file
+cp ~/KlipperXL/config/variables.cfg ~/printer_data/config/variables.cfg
+
+# Create macros directory and copy macros
+mkdir -p ~/printer_data/config/macros
+cp ~/KlipperXL/config/macros/print_macros.cfg ~/printer_data/config/macros/print_macros.cfg
+```
+
+### 5.2 Update Serial Port in printer.cfg
+
+**Note:** You will update this after flashing the XLBuddy in the next step. For now, leave it as-is.
+
+---
+
+## 6. Flash XLBuddy MCU
+
+### 6.1 Enter DFU Mode
 
 **IMPORTANT: This requires physical access to the XLBuddy board!**
 
 1. **Power OFF** the printer completely
 2. Locate the **BOOT0 jumper** on the XLBuddy board
 3. **Install the jumper** to enable DFU mode
-4. **Power ON** the printer (connect USB to Pi)
-5. The XLBuddy is now in DFU mode (no display activity is normal)
+4. Connect the XLBuddy to the Pi via USB cable
+5. **Power ON** the printer
+6. The XLBuddy is now in DFU mode (no display activity is normal)
 
-### 5.2 Flash via DFU
+### 6.2 Flash via DFU
 
 On the Pi:
 
@@ -222,62 +246,24 @@ Flash the firmware:
 sudo dfu-util -a 0 -s 0x08000000:leave -D ~/klipper/out/klipper.bin
 ```
 
-### 5.3 Exit DFU Mode
+### 6.3 Exit DFU Mode
 
 1. **Power OFF** the printer
 2. **Remove the BOOT0 jumper**
 3. **Power ON** the printer
 4. The XLBuddy should now appear as a USB serial device
 
-Verify:
+### 6.4 Update Serial Port in printer.cfg
+
+Get your device ID:
 ```bash
 ls /dev/serial/by-id/
 ```
 
-You should see something like: `usb-Klipper_stm32f407xx_...`
+You should see something like: `usb-Klipper_stm32f407xx_XXXXXXXXX-if00`
 
----
-
-## 6. Deploy Python Modules
-
-Copy all Python extras to Klipper:
-
+Edit printer.cfg:
 ```bash
-cp ~/KlipperXL/klippy/puppy_bootloader.py ~/klipper/klippy/extras/
-cp ~/KlipperXL/klippy/loadcell_probe.py ~/klipper/klippy/extras/
-cp ~/KlipperXL/klippy/pca9557.py ~/klipper/klippy/extras/
-cp ~/KlipperXL/klippy/dwarf_accelerometer.py ~/klipper/klippy/extras/
-cp ~/KlipperXL/klippy/modbus_master.py ~/klipper/klippy/extras/
-cp ~/KlipperXL/klippy/tool_offsets.py ~/klipper/klippy/extras/
-```
-
----
-
-## 7. Deploy Configuration Files
-
-### 7.1 Copy Configuration Files
-
-```bash
-# Main printer.cfg
-cp ~/KlipperXL/config/printer.cfg ~/printer_data/config/printer.cfg
-
-# Tool offsets (will need recalibration for your machine)
-cp ~/KlipperXL/config/tool_offsets.cfg ~/printer_data/config/tool_offsets.cfg
-
-# Variables file
-cp ~/KlipperXL/config/variables.cfg ~/printer_data/config/variables.cfg
-
-# Create macros directory and copy macros
-mkdir -p ~/printer_data/config/macros
-cp ~/KlipperXL/config/macros/print_macros.cfg ~/printer_data/config/macros/print_macros.cfg
-```
-
-### 7.2 Update Serial Port in printer.cfg
-
-SSH to your Pi and edit printer.cfg:
-
-```bash
-ssh pi@${PI_IP}
 nano ~/printer_data/config/printer.cfg
 ```
 
@@ -288,9 +274,9 @@ Find the `[mcu]` section and update the serial port:
 serial: /dev/serial/by-id/usb-Klipper_stm32f407xx_XXXXXXXXX-if00
 ```
 
-Replace `XXXXXXXXX` with your actual device ID from `ls /dev/serial/by-id/`
+Replace `XXXXXXXXX` with your actual device ID.
 
-### 7.3 Restart Klipper
+### 6.5 Restart Klipper
 
 ```bash
 sudo systemctl restart klipper
@@ -298,23 +284,18 @@ sudo systemctl restart klipper
 
 ---
 
-## 8. Fix Klipper Update Manager (Dirty State)
+## 7. Fix Klipper Update Manager (Dirty State)
 
 ### The Problem
 
-After deploying KlipperXL files, Moonraker's Update Manager will show Klipper as **"dirty"** because we added custom files to the Klipper git repo. This prevents applying Klipper updates through Mainsail.
+After deploying KlipperXL files, Moonraker's Update Manager will show Klipper as **"dirty"** because we added custom files to the Klipper git repo. This prevents applying Klipper updates through the web UI.
 
 ### The Fix
 
-We provide an automated script that fixes this. SSH to your Pi and run:
+Run the included fix script:
 
 ```bash
-# Copy the script to your Pi first (from your build computer)
-scp ~/KlipperXL/scripts/fix_klipper_dirty.sh pi@${PI_IP}:/tmp/
-
-# SSH to Pi and run it
-ssh pi@${PI_IP}
-bash /tmp/fix_klipper_dirty.sh
+bash ~/KlipperXL/scripts/fix_klipper_dirty.sh
 ```
 
 The script does three things:
@@ -329,7 +310,7 @@ klippy/extras/dwarf_accelerometer.py
 klippy/extras/loadcell_probe.py
 klippy/extras/modbus_master.py
 klippy/extras/pca9557.py
-src/stm32/modbus_stm32f4.c
+src/modbus_stm32f4.c
 .config_xlbuddy
 ```
 
@@ -359,14 +340,14 @@ Restart Moonraker for changes to take effect:
 sudo systemctl restart moonraker
 ```
 
-Then refresh the Update Manager in Mainsail - Klipper should now show as clean and updates can be applied normally.
+Then refresh the Update Manager in the web UI - Klipper should now show as clean and updates can be applied normally.
 
 ### Important: After Klipper Updates
 
 When you apply a Klipper update through Moonraker, git may reset the `assume-unchanged` flags on the Makefiles. If Klipper shows as "dirty" again after an update, just re-run the script:
 
 ```bash
-bash /tmp/fix_klipper_dirty.sh
+bash ~/KlipperXL/scripts/fix_klipper_dirty.sh
 sudo systemctl restart moonraker
 ```
 
@@ -393,15 +374,14 @@ sudo systemctl restart moonraker
 
 ---
 
-## 9. Optional: LED Strips and Webcam
+## 8. Optional: LED Strips and Webcam
 
-### 9.1 Side LED Strips (klipper-led_effect)
+### 8.1 Side LED Strips (klipper-led_effect)
 
 If your Prusa XL has side LED strips connected to PG14 (SPI6 MOSI):
 
 **Install the klipper-led_effect plugin:**
 ```bash
-ssh pi@${PI_IP}
 cd ~
 git clone https://github.com/julianschill/klipper-led_effect.git
 ln -s ~/klipper-led_effect/src/led_effect.py ~/klipper/klippy/extras/led_effect.py
@@ -409,8 +389,7 @@ ln -s ~/klipper-led_effect/src/led_effect.py ~/klipper/klippy/extras/led_effect.
 
 **Deploy the LED effects config:**
 ```bash
-# From your build computer
-scp ~/KlipperXL/config/led_effects.cfg pi@${PI_IP}:~/printer_data/config/led_effects.cfg
+cp ~/KlipperXL/config/led_effects.cfg ~/printer_data/config/led_effects.cfg
 ```
 
 The LED configuration is already included in the printer.cfg (`[neopixel side_leds]` section).
@@ -421,11 +400,10 @@ Status macros are wired into START_PRINT, END_PRINT, PAUSE, RESUME, and CANCEL_P
 - Chain count is 2 (driver 1 = RGB, driver 2 = White channel)
 - Mux select pin PE9 is held HIGH via `[output_pin led_mux_select]`
 
-### 9.2 USB Webcam (Crowsnest)
+### 8.2 USB Webcam (Crowsnest)
 
 **Install Crowsnest:**
 ```bash
-ssh pi@${PI_IP}
 cd ~
 git clone https://github.com/mainsail-crew/crowsnest.git
 cd crowsnest
@@ -434,8 +412,7 @@ make install
 
 **Deploy the webcam config:**
 ```bash
-# From your build computer
-scp ~/KlipperXL/config/crowsnest.conf pi@${PI_IP}:~/printer_data/config/crowsnest.conf
+cp ~/KlipperXL/config/crowsnest.conf ~/printer_data/config/crowsnest.conf
 ```
 
 **Start the service:**
@@ -447,19 +424,19 @@ The default config is set for 1920x1080 at 30fps using the ustreamer backend. Ed
 
 ---
 
-## 10. Configure OrcaSlicer
+## 9. Configure OrcaSlicer
 
 Use the built-in **Generic Tool Changer** profile as your base. It already has
 multi-tool settings (wipe tower, purge volumes, tool change handling). You only
 need to make the changes below.
 
-### 10.1 Select Printer Profile
+### 9.1 Select Printer Profile
 
 1. Open OrcaSlicer
 2. Go to **Printer** tab > **Add Printer** or select from dropdown
 3. Choose **Generic Tool Changer** (5-tool variant)
 
-### 10.2 Change These 4 Settings
+### 9.2 Change These 4 Settings
 
 #### 1. G-code Flavor
 
@@ -504,7 +481,7 @@ safe for Prusa XL hardware. Change to these Prusa-matched values:
 
 Prusa XL hardware limit is 7000. Never exceed this.
 
-### 10.3 Additional Settings
+### 9.3 Additional Settings
 
 #### Pause G-code
 ```gcode
@@ -550,12 +527,12 @@ G92 E0
 | Enable ooze prevention | **ON** |
 | Standby temperature delta | **-110** |
 
-### 10.4 Save as New Profile
+### 9.4 Save as New Profile
 
 Save as a new printer profile (e.g., "KlipperXL 5-Tool") so your changes
 don't get overwritten by OrcaSlicer updates.
 
-### 10.5 Alternative: Import Pre-configured Profile
+### 9.5 Alternative: Import Pre-configured Profile
 
 If you prefer importing a complete profile bundle instead of modifying
 the generic tool changer profile:
@@ -566,24 +543,24 @@ the generic tool changer profile:
 
 ---
 
-## 11. First Boot and Calibration
+## 10. First Boot and Calibration
 
-### 11.1 Initial Startup
+### 10.1 Initial Startup
 
-1. Open Mainsail in browser: `http://<PI_IP>`
+1. Open your web UI in browser: `http://<PI_IP>`
 2. You should see the printer interface
 3. Check for any errors in the console
 
-### 11.2 Verify Dwarf Communication
+### 10.2 Verify Dwarf Communication
 
-In Mainsail console, run:
+In the console, run:
 ```gcode
 DWARF_STATUS
 ```
 
 You should see temperatures for all 5 Dwarfs (D1-D5).
 
-### 11.3 Home the Printer
+### 10.3 Home the Printer
 
 ```gcode
 G28 X Y    ; Home X and Y (sensorless)
@@ -591,7 +568,7 @@ T0         ; Pick tool 0
 G28 Z      ; Home Z with loadcell
 ```
 
-### 11.4 Z Tilt Correction (Level the Bed)
+### 10.4 Z Tilt Correction (Level the Bed)
 
 ```gcode
 PRUSA_Z_LEVEL
@@ -599,7 +576,7 @@ PRUSA_Z_LEVEL
 
 **Note:** This is LOUD - the bed crashes into the top frame. This is normal!
 
-### 11.5 Calibrate Tool Offsets
+### 10.5 Calibrate Tool Offsets
 
 **IMPORTANT: You need the calibration pin installed at bed center (X=180, Y=180)**
 
@@ -614,7 +591,7 @@ This will:
 
 **Note on tool offsets:** Offsets are stored in Prusa/Marlin convention but automatically negated when applied via Klipper's SET_GCODE_OFFSET. This is handled internally - you don't need to worry about sign conventions.
 
-### 11.6 Test Each Tool
+### 10.6 Test Each Tool
 
 ```gcode
 T0    ; Pick tool 0
@@ -627,7 +604,7 @@ T0    ; Back to T0
 
 Verify each tool picks and parks cleanly.
 
-### 11.7 Heat Test
+### 10.7 Heat Test
 
 ```gcode
 T0
@@ -636,11 +613,11 @@ M104 T1 S200    ; Heat T1 to 200C
 M109 T0 S200    ; Wait for T0
 ```
 
-Verify temperatures in Mainsail match expectations.
+Verify temperatures in the web UI match expectations.
 
 ---
 
-## 12. Troubleshooting
+## 11. Troubleshooting
 
 ### "make: cpp: No such file or directory" during firmware build
 - Missing host C preprocessor — install build tools:
@@ -648,6 +625,11 @@ Verify temperatures in Mainsail match expectations.
   sudo apt install build-essential gcc-arm-none-eabi
   ```
 - Then retry: `make clean && make -j4`
+
+### "Multiple definitions for command 'identify'" during firmware build
+- The `.config` file is outdated or incompatible with your Klipper version
+- Delete `.config` and re-run `make menuconfig` (see [Section 3.4](#34-configure-the-build))
+- Do **not** use the pre-built config file — always use `make menuconfig`
 
 ### "MCU 'mcu' shutdown: Timer too close"
 - The MCU firmware wasn't flashed correctly
@@ -682,9 +664,9 @@ Verify temperatures in Mainsail match expectations.
 - If persistent, check Dwarf heater connections
 
 ### Klipper shows "dirty" in Update Manager
-- Run the fix script: `bash /tmp/fix_klipper_dirty.sh`
+- Run the fix script: `bash ~/KlipperXL/scripts/fix_klipper_dirty.sh`
 - Restart Moonraker: `sudo systemctl restart moonraker`
-- See [Section 8](#8-fix-klipper-update-manager-dirty-state) for details
+- See [Section 7](#7-fix-klipper-update-manager-dirty-state) for details
 
 ### Tool offsets seem wrong / first layer too high or low
 - Re-run `CALIBRATE_TOOL_OFFSETS` with calibration pin installed
@@ -703,6 +685,12 @@ Verify temperatures in Mainsail match expectations.
 | `pca9557.py` | I2C GPIO expander for Dwarf reset lines |
 | `dwarf_accelerometer.py` | Accelerometer for Input Shaper |
 | `modbus_master.py` | MODBUS communication layer |
+| `tool_offsets.py` | Per-tool Z offset management |
+
+### Files on Pi (`/home/pi/klipper/src/`)
+| File | Purpose |
+|------|---------|
+| `modbus_stm32f4.c` | MCU-side MODBUS, I2C, loadcell, and filament sensor code |
 
 ### Files on Pi (`/home/pi/printer_data/config/`)
 | File | Purpose |
@@ -763,4 +751,4 @@ Verify temperatures in Mainsail match expectations.
 
 ---
 
-*Guide updated 2026-02-09 for KlipperXL project*
+*Guide updated 2026-04-05 for KlipperXL project*
