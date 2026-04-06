@@ -612,7 +612,27 @@ PRUSA_Z_LEVEL
 
 **Note:** This is LOUD - the bed crashes into the top frame. This is normal!
 
-### 10.5 Calibrate Tool Offsets
+### 10.5 Calibrate Dock Positions
+
+Each printer's dock positions vary slightly. Run dock calibration to measure the actual positions:
+
+```gcode
+DOCK_CALIBRATE
+```
+
+This will guide you through each dock interactively:
+1. Remove dock pins
+2. Loosen pillar screws
+3. Slide carriage by hand to lock onto the tool
+4. Tighten screws
+5. Install pins
+6. Automatic pick/park verification
+
+The carriage moves to center between docks so you can access the next one. After all docks are calibrated, run `SAVE_CONFIG` to save the positions.
+
+**Note:** Default dock positions (T0=25mm, T1=107mm, T2=189mm, T3=271mm, T4=353mm, Y=455mm) are included in printer.cfg. Dock calibration refines these for your specific machine.
+
+### 10.6 Calibrate Tool Offsets
 
 **IMPORTANT: You need the calibration pin installed at bed center (X=180, Y=180)**
 
@@ -627,7 +647,7 @@ This will:
 
 **Note on tool offsets:** Offsets are stored in Prusa/Marlin convention but automatically negated when applied via Klipper's SET_GCODE_OFFSET. This is handled internally - you don't need to worry about sign conventions.
 
-### 10.6 Test Each Tool
+### 10.7 Test Each Tool
 
 ```gcode
 T0    ; Pick tool 0
@@ -640,7 +660,7 @@ T0    ; Back to T0
 
 Verify each tool picks and parks cleanly.
 
-### 10.7 Heat Test
+### 10.8 Heat Test
 
 ```gcode
 T0
