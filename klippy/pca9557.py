@@ -64,19 +64,25 @@ class PCA9557:
         
         # Register gcode commands
         gcode = self.printer.lookup_object('gcode')
-        gcode.register_command('PCA9557_RELEASE_DWARFS',
+        gcode.register_command('IOEXP_RELEASE_DWARFS',
                                self.cmd_RELEASE_DWARFS,
                                desc="Release all Dwarf toolheads from reset")
-        gcode.register_command('PCA9557_RESET_DWARFS',
+        gcode.register_command('IOEXP_RESET_DWARFS',
                                self.cmd_RESET_DWARFS,
                                desc="Put all Dwarf toolheads into reset")
-        gcode.register_command('PCA9557_STATUS',
+        gcode.register_command('IOEXP_STATUS',
                                self.cmd_STATUS,
                                desc="Show PCA9557 GPIO expander status")
-        gcode.register_command('PCA9557_SET_PIN',
+        gcode.register_command('IOEXP_SET_PIN',
                                self.cmd_SET_PIN,
                                desc="Set a specific PCA9557 pin")
-        
+        gcode.register_command('ENCLOSURE_FAN_POWER_ON',
+                               self.cmd_FAN_POWER_ON,
+                               desc="Enable 12V rail to the enclosure fan header")
+        gcode.register_command('ENCLOSURE_FAN_POWER_OFF',
+                               self.cmd_FAN_POWER_OFF,
+                               desc="Disable 12V rail to the enclosure fan header")
+
         logging.info("PCA9557: GPIO expander configured")
     
     def _handle_connect(self):
@@ -120,16 +126,26 @@ class PCA9557:
                      self.output_state)
     
     def _set_pin(self, pin, state):
-        """Set a specific pin high or low"""
+        """Set a specific pin high or low without disturbing the others.
+
+        Uses read-modify-write on the actual hardware register rather than
+        a cached variable. This is important because the PCA9557 is shared
+        with the MODBUS firmware (modbus_stm32f4.c) and puppy_bootloader —
+        they drive pin state during Dwarf boot sequences, so any cached
+        state in this Python module can go stale. Always read hardware
+        first so we preserve whatever the other actors set.
+        """
         if pin < 0 or pin > 7:
             raise ValueError("Pin must be 0-7")
-        
+
+        current = self._read_register(REG_OUTPUT)
         if state:
-            self.output_state |= (1 << pin)
+            current |= (1 << pin)
         else:
-            self.output_state &= ~(1 << pin)
-        
-        self._write_register(REG_OUTPUT, self.output_state)
+            current &= ~(1 << pin)
+
+        self._write_register(REG_OUTPUT, current)
+        self.output_state = current  # keep cache in sync (informational only)
     
     def cmd_RELEASE_DWARFS(self, gcmd):
         """G-code command to release Dwarfs from reset"""
@@ -156,6 +172,24 @@ class PCA9557:
             gcmd.respond_info("PCA9557: Pin %d set to %d" % (pin, state))
         except Exception as e:
             gcmd.respond_info("PCA9557: Error - %s" % str(e))
+
+    def cmd_FAN_POWER_ON(self, gcmd):
+        """Enable 12V rail to the enclosure fan header (PCA9557 pin 6).
+        Only touches pin 6 — Dwarfs and modular bed are left alone."""
+        try:
+            self._set_pin(6, 1)
+            gcmd.respond_info("Enclosure fan power: ON")
+        except Exception as e:
+            gcmd.respond_info("Enclosure fan power: Error - %s" % str(e))
+
+    def cmd_FAN_POWER_OFF(self, gcmd):
+        """Disable 12V rail to the enclosure fan header (PCA9557 pin 6).
+        Only touches pin 6 — Dwarfs and modular bed are left alone."""
+        try:
+            self._set_pin(6, 0)
+            gcmd.respond_info("Enclosure fan power: OFF")
+        except Exception as e:
+            gcmd.respond_info("Enclosure fan power: Error - %s" % str(e))
     
     def cmd_STATUS(self, gcmd):
         """G-code command to show PCA9557 status"""
