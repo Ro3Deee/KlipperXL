@@ -6,6 +6,10 @@ All notable changes to KlipperXL are documented here.
 
 ## 2026-04-14
 
+### Force-flash button sequence documented
+- Section 6.2 now explains how to trigger the Prusa bootloader's firmware-update menu: press the selector knob on power-up, or reset + double-press the knob to force the update menu
+- Credit @Ro3Deee ([#13](https://github.com/racoutlaw/KlipperXL/issues/13)) for pointing out that some users couldn't get the bootloader to see `klipper.bbf` without the button sequence
+
 ### USB BBF is now the default flash method
 - Restructured `INSTALLATION_GUIDE.md` to make USB drive flashing the primary path (Section 6)
 - DFU flashing moved to Section 12 as an advanced / recovery-only method

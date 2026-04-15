@@ -301,14 +301,16 @@ cp ~/klipper/out/klipper.bbf /media/pi/<USB_NAME>/
 
 1. Safely eject the USB drive from your computer / Pi
 2. Plug it into the **printer's front USB port**
-3. **Power cycle** the printer (off, wait a few seconds, on)
-4. The Prusa bootloader screen appears and detects `klipper.bbf`
+3. **Power on** the printer and **press the selector knob** as it boots to open the firmware update menu
+4. The bootloader detects `klipper.bbf` — confirm the flash
 5. If prompted about signature verification, click **Ignore**
 6. Let the bootloader flash the firmware
 7. The progress bar will **stop at ~50%** — **this is normal**. Klipper has taken over and doesn't drive the printer display
 8. Power OFF the printer
 9. Remove the USB drive
 10. Power ON the printer
+
+> 💡 **If the printer doesn't see the firmware on boot:** press the **reset button** and immediately **double-press the selector knob** to force the bootloader into firmware-update mode. This is the "force flashing" sequence that skips any menu delay. Credit: @Ro3Deee ([#13](https://github.com/racoutlaw/KlipperXL/issues/13)).
 
 ### 6.3 Update Serial Port in printer.cfg
 
