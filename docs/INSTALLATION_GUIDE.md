@@ -301,16 +301,17 @@ cp ~/klipper/out/klipper.bbf /media/pi/<USB_NAME>/
 
 1. Safely eject the USB drive from your computer / Pi
 2. Plug it into the **printer's front USB port**
-3. **Power on** the printer and **press the selector knob** as it boots to open the firmware update menu
-4. The bootloader detects `klipper.bbf` — confirm the flash
-5. If prompted about signature verification, click **Ignore**
-6. Let the bootloader flash the firmware
-7. The progress bar will **stop at ~50%** — **this is normal**. Klipper has taken over and doesn't drive the printer display
-8. Power OFF the printer
-9. Remove the USB drive
-10. Power ON the printer
+3. **Power cycle** the printer
+4. When the **Prusa logo appears** on boot, press the **selector knob 2–3 times** — this opens the bootloader's firmware update menu
+5. The bootloader detects `klipper.bbf` — confirm the flash
+6. If prompted about signature verification, click **Ignore**
+7. Let the bootloader flash the firmware
+8. The progress bar will **stop at ~50%** — **this is normal**. Klipper has taken over and doesn't drive the printer display
+9. Power OFF the printer
+10. Remove the USB drive
+11. Power ON the printer
 
-> 💡 **If the printer doesn't see the firmware on boot:** press the **reset button** and immediately **double-press the selector knob** to force the bootloader into firmware-update mode. This is the "force flashing" sequence that skips any menu delay. Credit: @Ro3Deee ([#13](https://github.com/racoutlaw/KlipperXL/issues/13)).
+> 💡 **Alternate method / if the bootloader doesn't see the firmware:** hit the **reset button** and then press the **selector knob 2–3 times** right after. Same result as the power-cycle method — opens the firmware update menu. Credit: @Ro3Deee ([#13](https://github.com/racoutlaw/KlipperXL/issues/13)).
 
 ### 6.3 Update Serial Port in printer.cfg
 
