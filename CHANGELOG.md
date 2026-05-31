@@ -1,3 +1,85 @@
+## 2026-05-30
+
+### Loadcell mesh-probe reliability fixes
+- Fixed intermittent first-mesh-point probe failure ("Probe triggered prior to movement" with sample_count=0)
+- Three host-side fixes in `puppy_bootloader.py`, all addressing asymmetry between Z-home and bed-mesh probe paths:
+  - `run_probe`: added `toolhead.wait_moves()` before tare so the loadcell samples a settled toolhead instead of mid-deceleration
+  - `multi_probe_begin`: post-coil-on settle 0.2s → 1.0s so the loadcell FIFO refills with steady-state samples before tare
+  - `LoadcellEndstop.home_wait`: disarm via `probe_stop_cmd` instead of re-arming with `oid=0xff` — preserves MCU diagnostic state (count/load/min/max) for failure capture instead of wiping it
+- Root cause confirmed by 3-agent code read: trsync framework and MCU loadcell module are both clean; bug was host-side Z-home/mesh path asymmetry
+- Multiple clean bed-mesh runs validated post-deploy
+
+### Loadcell probe DIAG instrumentation
+- Added `DIAG probe-start` (X/Y/Z/threshold/multi-mode) and `DIAG probe-FAIL` (MCU count/load/min/max/errors + endpos) logging in `run_probe`
+- Added `DIAG home_wait NO-HIT` log for non-trigger trsync results
+- Provides actionable data in `klippy.log` when probe failures recur
+
+### Anti-ooze: END_PRINT auto-retract + cancel-path retract
+- `END_PRINT` macro now does a hot-guarded `G1 E-20 F1800` deep retract to empty the melt zone while the nozzle is still at print temp
+- Hot path emits `RESPOND MSG="END_PRINT: deep retract E-20 (nozzle XXXC)"` so users see the action fire; skip path (nozzle below `min_extrude_temp`) emits a corresponding skip message
+- New `_MELT_RETRACT_ON_CANCEL` macro mirrors the same retract on print cancel
+- `_CLIENT_VARIABLE` macro registers `_MELT_RETRACT_ON_CANCEL` as Fluidd's `user_cancel_macro` hook so cancel-from-pause fires the retract
+- Reduces dock-ooze residue and lowers refill-on-next-print burden
+
+### Babystep capture via SAVE_TOOL_Z_OFFSET wrapper
+- New `[gcode_macro SET_GCODE_OFFSET]` wraps Klipper's stock `SET_GCODE_OFFSET`
+- On a babystep `Z_ADJUST`, calls `SAVE_TOOL_Z_OFFSET` to stage the active tool's `tN_z_offset` immediately
+- Stage survives print complete / cancel / soft-error; lost only on hard klippy shutdown (then `SAVE_CONFIG` before risky prints)
+- Toolchange and homing `Z_ADJUST` calls pass through untouched
+
+### max_extrude_cross_section bumped
+- `5.0 → 50.0` (in `[extruder]`) to accommodate slicer-emitted purge moves that exceed the default 4×nozzle² limit (would otherwise error mid-print on the first prime line)
+
+---
+
+## Upgrading from an earlier version
+
+The install **procedure** itself has not changed (USB BBF flash, MCU build, Python module deploy are all the same). However existing users updating to this version need to take these steps:
+
+### 1. Update Python modules
+Re-run the install script's Python deploy step, OR manually copy:
+```bash
+cp klippy/puppy_bootloader.py /home/pi/klipper/klippy/extras/puppy_bootloader.py
+sudo systemctl restart klipper
+```
+
+### 2. Copy the new macros into your existing `printer.cfg`
+(Skip this step if you're replacing your `printer.cfg` wholesale with the new template — but back up your `SAVE_CONFIG` block first, it contains your calibration!)
+
+From the new `config/printer.cfg`, copy these blocks into your local printer.cfg:
+- **`[gcode_macro SET_GCODE_OFFSET]`** — babystep capture (wraps Klipper's stock `SET_GCODE_OFFSET` and stages `tN_z_offset` on `Z_ADJUST`)
+- **`[gcode_macro _CLIENT_VARIABLE]`** — Fluidd cancel-macro hook (registers the cancel-retract)
+- **`[gcode_macro _MELT_RETRACT_ON_CANCEL]`** — cancel-path deep retract
+- **`[gcode_macro END_PRINT]`** — REPLACE your existing END_PRINT block with the new version (adds hot-guarded deep retract + RESPOND messages)
+
+### 3. Bump `max_extrude_cross_section`
+In your `[extruder]` block, change `max_extrude_cross_section: 5.0` → `max_extrude_cross_section: 50.0`.
+Required if your slicer emits purge moves wider than 4× nozzle area (most modern slicers do for prime lines). No reason not to update.
+
+### 4. Restart klipper
+```bash
+sudo systemctl restart klipper
+```
+Or `RESTART` from the gcode console. Verify klippy comes back to "Ready" state with no config errors.
+
+---
+
+## Troubleshooting recipe: occasional hard X/Y home tap → missed tool pick
+
+If you see your X or Y axis occasionally do a "hard tap" at homing (sometimes skipping a step), and that misalignment causes a downstream tool-pick failure ("Tool not detected as picked after wiggle"), the following values were validated on the developer's XL as a starting point you can try:
+
+- `[tmc2130 stepper_x]` and `[tmc2130 stepper_y]`:
+  - `homing_speed: 55` (default is 52)
+  - `second_homing_speed: 55` (default is 52)
+  - `driver_SGT: 0` (default is 1)
+- `[homing_override]` macro: change `{% set HOME_CUR = 0.750 %}` → `{% set HOME_CUR = 0.70 %}`
+
+**Rationale:** Higher `homing_speed` puts TMC2130 StallGuard back inside its velocity window where the trigger is more decisive. Lower `HOME_CUR` softens the impact at trip.
+
+**These values are per-printer.** StallGuard sensitivity depends on mechanical variance between XLs (belt tension, frame stiffness, motor batch tolerances, even dock magnet strength). The above is a known-good starting point — your printer's sweet spot may differ. If `0.70` is too low and you start missing home detection entirely, step up by 0.02 at a time. If `55` mm/s feels too fast and causes overshoot, try 54. Do not adopt these values unless you're already experiencing the hard-tap problem.
+
+---
+
 # Changelog
 
 All notable changes to KlipperXL are documented here.
