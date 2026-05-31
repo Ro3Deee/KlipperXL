@@ -208,12 +208,22 @@ class LoadcellEndstop:
         # Wait for trsync to complete
         self._dispatch.wait_end(home_end_time)
 
-        # Stop monitoring on MCU (trsync_oid=0xff disables)
-        if self._home_cmd is not None:
+        # Stop monitoring on MCU - probe_stop preserves diagnostic state
+        # (re-arming with oid=0xff re-runs the full reset on the MCU and wipes
+        # count/load/min/max before DIAG can read them on a failure)
+        if self._puppy.probe_stop_cmd is not None:
+            self._puppy.probe_stop_cmd.send([])
+        elif self._home_cmd is not None:
             self._home_cmd.send([self._dwarf_addr, 0, 0, 0xff, 0])
 
         # Get result from dispatch
         res = self._dispatch.stop()
+
+        # DIAG: log the trsync end-reason whenever the probe did NOT hit (failure path)
+        if res != self.REASON_ENDSTOP_HIT:
+            logging.info("DIAG home_wait NO-HIT: res=%s (HIT=%s COMMS_TIMEOUT=%s) end_time=%.3f"
+                         % (res, self.REASON_ENDSTOP_HIT,
+                            mcu_module.MCU_trsync.REASON_COMMS_TIMEOUT, home_end_time))
 
         if res >= mcu_module.MCU_trsync.REASON_COMMS_TIMEOUT:
             raise self._printer.command_error(
@@ -409,7 +419,9 @@ class LoadcellProbe:
                 self._puppy.reactor.pause(self._puppy.reactor.monotonic() + 0.1)
                 self._puppy._write_coil(dwarf, self._puppy.LOADCELL_COIL, True)
                 self._puppy.loadcell_enabled[dwarf] = True
-                self._puppy.reactor.pause(self._puppy.reactor.monotonic() + 0.2)
+                # FIFO needs time to refill with steady-state samples post-coil-on;
+                # 0.2s left stale/transient readings in flight at tare time
+                self._puppy.reactor.pause(self._puppy.reactor.monotonic() + 1.0)
             # Tare and store as reference baseline for deviation check (Prusa-style)
             if self._puppy.tare_mcu_cmd is not None:
                 result = self._puppy.tare_mcu_cmd.send([modbus_addr, 48])
@@ -460,6 +472,9 @@ class LoadcellProbe:
         orig_max_accel = toolhead.max_accel
         toolhead.max_accel = min(500.0, orig_max_accel)
         phoming = self._printer.lookup_object('homing')
+
+        # Flush queued moves before tare/probe (loadcell needs settled toolhead)
+        toolhead.wait_moves()
 
         # Get current position
         curpos = toolhead.get_position()
@@ -560,10 +575,27 @@ class LoadcellProbe:
         pos = list(curpos)
         pos[2] = target_z
         logging.info(f"LoadcellProbe: Probing from Z={curpos[2]:.2f} to Z={target_z:.2f} (z_min={z_min:.2f})")
+        logging.info("DIAG probe-start: X=%.2f Y=%.2f Zstart=%.2f targetZ=%.2f speed=%s thr_raw=%s multi=%s"
+                     % (curpos[0], curpos[1], curpos[2], target_z, speed,
+                        threshold_raw, self._multi_probe_pending))
 
         try:
             epos = phoming.probing_move(self._endstop, pos, speed)
         except self._printer.command_error as e:
+            # DIAG: on a failed probe, capture Klipper end-position + MCU loadcell stats.
+            # errors>0 => Modbus FIFO reads failing; count~0 & errors0 => Dwarf not streaming
+            # (FIFO empty); count high & min not below thr_raw => sampled but no contact force.
+            try:
+                endpos = toolhead.get_position()
+                st = (self._puppy.probe_stop_cmd.send([])
+                      if self._puppy.probe_stop_cmd is not None else {})
+                logging.info("DIAG probe-FAIL: err=%r endpos X=%.2f Y=%.2f Z=%.2f | "
+                             "mcu triggered=%s load=%s count=%s min=%s max=%s errors=%s"
+                             % (str(e), endpos[0], endpos[1], endpos[2],
+                                st.get('triggered'), st.get('load'), st.get('count'),
+                                st.get('min'), st.get('max'), st.get('errors')))
+            except Exception as diag_e:
+                logging.info("DIAG probe-FAIL: diagnostic query errored: %s" % (diag_e,))
             if "prior to movement" in str(e):
                 raise gcmd.error("Loadcell triggered before probe - check tare")
             raise
@@ -6559,16 +6591,53 @@ class PuppyBootloader:
             self.tare_mcu_cmd.send([modbus_addr, 48])
         self.reactor.pause(self.reactor.monotonic() + 0.3)
 
-        # === PHASE 2: Slow approach for accuracy (40g threshold) ===
-        self.gcode.respond_info("=== PHASE 2: Slow approach ===")
+        # === PHASE 2: Slow approach for accuracy (1st repeatability hit) ===
+        self.gcode.respond_info("=== PHASE 2: Slow approach (hit 1) ===")
         triggered, z2 = do_probe(slow_speed, "SLOW", threshold)
 
-        if triggered:
-            self.gcode.respond_info(f"PROBE COMPLETE: Z={z2:.4f}")
-            # Store result for use by other systems
-            self.last_probe_z = z2
-        else:
+        if not triggered:
             self.gcode.respond_info("PROBE FAILED on slow approach")
+        else:
+            # === PHASE 3: repeat slow hit(s) + repeatability gate (Prusa-style) ===
+            # Probe slow again and require two consecutive slow hits to agree
+            # within TOLERANCE; retry up to RETRIES times. The nozzle is left at
+            # the last good slow trigger so the caller's SET_KINEMATIC_POSITION
+            # Z=0 zeroes on the bed.
+            tolerance = gcmd.get_float('TOLERANCE', 0.030, above=0.)
+            max_retries = gcmd.get_int('RETRIES', 3, minval=0)
+            repeat_backoff = gcmd.get_float('REPEAT_BACKOFF', 0.5, above=0.)
+            prev_z = z2
+            final_z = z2
+            for attempt in range(1, max_retries + 1):
+                # back off a little + re-tare for the repeat slow hit
+                rpos = toolhead.get_position()
+                rpos[2] = rpos[2] + repeat_backoff
+                toolhead.manual_move(rpos, slow_speed)
+                toolhead.wait_moves()
+                if self.tare_mcu_cmd is not None:
+                    self.tare_mcu_cmd.send([modbus_addr, 48])
+                self.reactor.pause(self.reactor.monotonic() + 0.3)
+                self.gcode.respond_info(
+                    f"=== PHASE 3: Slow approach (repeat {attempt}/{max_retries}) ===")
+                rtriggered, z3 = do_probe(slow_speed, "SLOW", threshold)
+                if not rtriggered:
+                    self.gcode.respond_info("PROBE FAILED on repeat slow approach")
+                    break
+                diff = abs(prev_z - z3)
+                self.gcode.respond_info(
+                    f"  Repeatability: {prev_z:.4f} vs {z3:.4f} -> "
+                    f"diff={diff:.4f} (tol={tolerance:.3f})")
+                final_z = z3
+                if diff <= tolerance:
+                    self.gcode.respond_info(
+                        f"PROBE COMPLETE: Z={z3:.4f} (repeatable within {tolerance:.3f})")
+                    break
+                prev_z = z3
+                if attempt == max_retries:
+                    self.gcode.respond_info(
+                        f"WARNING: slow hits never agreed within {tolerance:.3f} "
+                        f"after {attempt} tries; using last Z={z3:.4f}")
+            self.last_probe_z = final_z
 
         # Disable loadcell
         self._write_coil(dwarf, self.LOADCELL_COIL, False)
