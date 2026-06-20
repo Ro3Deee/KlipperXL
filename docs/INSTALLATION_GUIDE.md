@@ -794,6 +794,11 @@ Verify temperatures in the web UI match expectations.
 - The offset sign is automatically handled (negated for Klipper)
 - Make sure nozzles are clean before calibration
 
+### KlipperScreen won't start (BTT HDMI5 / other displays)
+- Symptom: KlipperScreen refuses to start and never gets far enough to write a log
+- Fix: reinstall KlipperScreen and choose the **Wayland** backend instead of X11
+- Reported by [@teachingtechYT](https://github.com/teachingtechYT) on a BTT HDMI5 (issue [#21](https://github.com/racoutlaw/KlipperXL/issues/21))
+
 ---
 
 ## File Summary
