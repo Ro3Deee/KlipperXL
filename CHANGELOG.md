@@ -33,6 +33,20 @@
 
 Files: `config/printer.cfg` (`PRUSA_Z_LEVEL` step 1)
 
+### CHANGED: tool offset calibration cleans the nozzles at 140 °C, not 100 °C
+
+- At 100 °C (2026-10-08) plastic stuck on the nozzle tips would not come off
+  with the brush - and a tip with plastic on it touches the pin through it, so
+  that tool's offset comes out wrong
+- Tested on the owner's XL with the same cleaning step in KlipperXL-Plus: at
+  140 °C the stuck plastic came off
+- Only the default changed: `CLEAN_TEMP=` still takes any temperature
+  (`CALIBRATE_TOOL_OFFSETS CLEAN_TEMP=100` for the 10/08 behaviour)
+- `klippy/puppy_bootloader.py` — one line. To update:
+  `cp klippy/puppy_bootloader.py ~/klipper/klippy/extras/`, then
+  `sudo systemctl restart klipper` - or keep your module and run
+  `CALIBRATE_TOOL_OFFSETS CLEAN_TEMP=140`
+
 ## 2026-10-08
 
 ### ADDED: homing bumps the right edge first, as stock does, to align the tool locks
