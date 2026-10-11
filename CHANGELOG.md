@@ -1,3 +1,38 @@
+## 2026-10-10
+
+### FIXED: Z alignment could drive the carriage into the right frame
+
+- `PRUSA_Z_LEVEL` lowered the bed first with `SET_KINEMATIC_POSITION Z=0`.
+  That Klipper command also marks X and Y as homed - right after a Klipper
+  restart that means X=0, Y=0, wherever the carriage really is
+- The `G28 X Y` that follows then handed X=0 Y=0 to the right-edge lock bump
+  (2026-10-08) as the real position, and the bump's fast move to the front
+  right corner drove the carriage into the right frame: it skipped steps until
+  the move ended. The move is planned as if from X=0, so it is harmless from
+  the far left, about half of it grinds from the middle, and nearly all of it
+  from the right-hand docks
+- Step 1 now lowers the bed with `FORCE_MOVE` on the Z motor (the same 10 mm),
+  which leaves the homed state of every axis alone. The lock bump then sees X/Y
+  as not homed and takes its stall-detecting route, as a plain `G28` does after
+  a restart. Works on every Klipper version
+- Tested on the owner's XL with the same macro and lock bump in KlipperXL-Plus
+  (his XL runs KlipperXL-Plus now): carriage parked at T4's dock, Klipper
+  restarted, Z alignment - the bump took the slow route, the two right-edge
+  hits agreed within 0.000 mm, the Z motors aligned. Not run on a KlipperXL
+  install
+
+**To update:**
+
+1. In **your own** `printer.cfg`, in `[gcode_macro PRUSA_Z_LEVEL]`, replace
+   the two step 1 lines `SET_KINEMATIC_POSITION Z=0` and
+   `G1 Z10 F{RAM_SPEED * 60}` with
+   `FORCE_MOVE STEPPER=stepper_z DISTANCE=10 VELOCITY={RAM_SPEED}` - copy it
+   (with its comment) from `config/printer.cfg`. Do not copy the shipped file
+   over yours
+2. `RESTART` in the console (a config change only)
+
+Files: `config/printer.cfg` (`PRUSA_Z_LEVEL` step 1)
+
 ## 2026-10-08
 
 ### ADDED: homing bumps the right edge first, as stock does, to align the tool locks
