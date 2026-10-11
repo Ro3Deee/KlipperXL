@@ -33,6 +33,27 @@
 
 Files: `config/printer.cfg` (`PRUSA_Z_LEVEL` step 1)
 
+### FIXED: tool offset calibration could save a wrong offset from one bad touch
+
+- The pin probing only *warned* - and then used the result anyway - when a
+  touch triggered before the nozzle had moved 0.1 mm, when five tries at one
+  spot never gave two agreeing touches (it used their average), or when a
+  tool's final points were more than 0.2 mm off their circle
+- Found on the owner's XL with the same probing code in KlipperXL-Plus: one
+  tool triggered early three times at one spot (0.04 mm each, agreeing with
+  each other), its centre moved 1.4 mm and a 1.55 mm offset was saved
+- Now as stock Prusa (`G425.cpp`): a touch that moved less than 0.1 mm is no
+  touch and is probed again; agreeing touches more than 3 mm from where the
+  pin should be, no agreement in five tries, or a final deviation over
+  0.2 mm stop the calibration with the reason - **nothing is saved**, and the
+  nozzle is lifted clear of the pin first
+- Tested in KlipperXL-Plus: the checks stopped two bad runs with the reason
+  and saved nothing, and passed a clean run (every final deviation
+  0.016-0.031 mm). Not run on a KlipperXL install
+- `klippy/puppy_bootloader.py`. To update:
+  `cp klippy/puppy_bootloader.py ~/klipper/klippy/extras/`, then
+  `sudo systemctl restart klipper`
+
 ### CHANGED: tool offset calibration cleans the nozzles at 140 °C, not 100 °C
 
 - At 100 °C (2026-10-08) plastic stuck on the nozzle tips would not come off

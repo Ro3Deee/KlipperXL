@@ -830,8 +830,18 @@ class LoadcellProbe:
         toolhead.wait_moves()
 
     def _probe_xy_verified(self, gcmd, center_x, center_y, probe_z, angle_rad,
-                           start_radius, probe_distance, speed, toolhead, pin_top_z):
-        """Take 2 XY samples and verify within 0.03mm (Prusa PROBE_ALLOWED_ERROR)."""
+                           start_radius, probe_distance, speed, toolhead, pin_top_z,
+                           pin_radius=3.0):
+        """Take 2 XY samples and verify within 0.03mm (Prusa PROBE_ALLOWED_ERROR).
+
+        With stock probe_xy_verify's rejections (G425.cpp l.357-412): a sample
+        that triggered too early is no hit and is probed again; agreed samples
+        more than 3 mm from where the pin should be, or no agreement in 5
+        tries, stop the calibration (2026-10-10: one early hit was kept and
+        moved a tool's centre 1.4 mm)."""
+        PROBE_FAIL_THRESHOLD_MM = 3.0   # Prusa G425.cpp l.136
+        PROBE_Z_BORE_MM = 1.0           # as in CALIBRATE_TOOL_OFFSETS
+        deg = math.degrees(angle_rad) % 360.
         PROBE_ALLOWED_ERROR = 0.03  # mm
         NUM_PROBE_SAMPLES = 2
         NUM_PROBE_TRIES = 5
@@ -858,6 +868,11 @@ class LoadcellProbe:
                 toolhead.manual_move([start_x, start_y, None], 25.0)
                 toolhead.wait_moves()
             
+            # Prusa: a hit that moved < 0.1 mm is no hit -> probe again
+            if any(s is None for s in samples):
+                logging.warning(f"PROBE_XY_VERIFIED: probe at {deg:.0f} deg triggered too early, probing again")
+                continue
+
             # Calculate average
             avg_x = sum(s[0] for s in samples) / len(samples)
             avg_y = sum(s[1] for s in samples) / len(samples)
@@ -867,13 +882,23 @@ class LoadcellProbe:
             
             if max_dist <= PROBE_ALLOWED_ERROR:
                 logging.info(f"PROBE_XY_VERIFIED: Samples agree within {max_dist:.4f}mm")
+                # Prusa synthetic_probe (G425.cpp l.352, 404): where this hit should be
+                exp_x = center_x + (pin_radius + PROBE_Z_BORE_MM) * math.cos(angle_rad)
+                exp_y = center_y + (pin_radius + PROBE_Z_BORE_MM) * math.sin(angle_rad)
+                exp_dist = math.sqrt((avg_x - exp_x)**2 + (avg_y - exp_y)**2)
+                if exp_dist > PROBE_FAIL_THRESHOLD_MM:
+                    raise gcmd.error("XY probe at %.0f deg touched %.2f mm from where the pin should be"
+                                     " (more than %.0f mm) - check the pin and the nozzle. The calibration"
+                                     " stopped and nothing was saved" % (deg, exp_dist, PROBE_FAIL_THRESHOLD_MM))
                 return (avg_x, avg_y)
             
             logging.warning(f"PROBE_XY_VERIFIED: Sample deviation {max_dist:.4f}mm > {PROBE_ALLOWED_ERROR}mm, retrying...")
         
-        # Failed after all retries - return last average anyway with warning
-        gcmd.respond_info("  WARNING: XY samples inconsistent after %d tries" % NUM_PROBE_TRIES)
-        return (avg_x, avg_y)
+        # Failed after all retries - stop (Prusa ERR_MECHANICAL_XY_PROBE_UNSTABLE),
+        # never use an average of disagreeing touches
+        raise gcmd.error("XY probe at %.0f deg did not give two agreeing touches in %d tries"
+                         " (probe unstable). The calibration stopped and nothing was saved"
+                         % (deg, NUM_PROBE_TRIES))
 
     def _probe_xy_at_angle(self, gcmd, center_x, center_y, probe_z, angle_rad,
                            start_radius, probe_distance, speed):
@@ -990,8 +1015,9 @@ class LoadcellProbe:
         epos = phoming.probing_move(xy_endstop, pos, speed)
         # Prusa MIN_TRAVELED_DISTANCE_MM check (0.1mm)
         travel_dist = math.sqrt((epos[0] - start_x)**2 + (epos[1] - start_y)**2)
-        if travel_dist < 0.1:
-            logging.warning(f"PROBE_XY: Travel too short ({travel_dist:.3f}mm < 0.1mm) - probe may have triggered early")
+        early = travel_dist < 0.1
+        if early:
+            logging.warning(f"PROBE_XY: Travel too short ({travel_dist:.3f}mm < 0.1mm) - triggered too early, discarded")
         logging.info(f"PROBE_XY: Contact at ({epos[0]:.3f},{epos[1]:.3f}), traveled {travel_dist:.2f}mm")
 
         # Retract away from pin
@@ -1004,6 +1030,8 @@ class LoadcellProbe:
         # Restore original acceleration
         toolhead.max_accel = orig_max_accel
         
+        if early:
+            return None
         return (epos[0], epos[1])
 
     def _check_xy_deviation(self, center, points, max_dev=0.2):
@@ -1554,10 +1582,20 @@ class LoadcellProbe:
                     try:
                         hit = self._probe_xy_verified(
                             gcmd, current_center[0], current_center[1], xy_probe_z, angle,
-                            start_radius, probe_distance, probe_speed, toolhead, current_center[2])
+                            start_radius, probe_distance, probe_speed, toolhead, current_center[2],
+                            pin_radius=pin_diameter / 2.)
                         hits.append(hit)
                     except Exception as e:
                         gcmd.respond_info("      XY probe %d FAILED: %s" % (i+1, str(e)))
+                        # the nozzle is below the pin top in a sweep: up first
+                        # (see SWEEP FINISHED below), so nothing after this moves
+                        # it sideways into the pin
+                        try:
+                            toolhead.manual_move(
+                                [None, None, current_center[2] + clearance], 10.0)
+                            toolhead.wait_moves()
+                        except Exception:
+                            logging.exception("PROBE_XY: lift after a failed XY probe")
                         raise
 
                     # NO Z retract between angles. The next _probe_xy_at_angle
@@ -1591,9 +1629,12 @@ class LoadcellProbe:
                 if phase == 2:
                     passed, max_dev = self._check_xy_deviation(center_xy, hits, 0.2)
                     if not passed:
-                        gcmd.respond_info("    WARNING: XY deviation %.3fmm exceeds 0.2mm" % max_dev)
-                    else:
-                        gcmd.respond_info("    XY deviation: %.3fmm (OK)" % max_dev)
+                        # Prusa G425: "Tool N center not found" - stop, save nothing
+                        # (the sweep already lifted clear above)
+                        raise gcmd.error("T%d centre not found: its final XY points deviate %.3f mm"
+                                         " (more than 0.2 mm). The calibration stopped and nothing"
+                                         " was saved" % (tool_num, max_dev))
+                    gcmd.respond_info("    XY deviation: %.3fmm (OK)" % max_dev)
 
                 gcmd.respond_info("    Center: X=%.4f Y=%.4f Z=%.4f" %
                                  (current_center[0], current_center[1], current_center[2]))
