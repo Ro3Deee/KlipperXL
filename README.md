@@ -5,6 +5,13 @@
 <h1 align="center">KlipperXL</h1>
 <p align="center"><b>Run Klipper firmware on your Prusa XL.</b></p>
 
+## 🆕 KlipperXL-Plus is out
+The next step for Klipper on the Prusa XL: **Klipper runs on every tool itself**, and it installs from one SD card with Raspberry Pi Imager. No terminal, no commands to type, guided calibration wizards. Prusa's factory bootloaders stay untouched, so going back to stock is just Prusa's own firmware file.
+
+👉 **[github.com/racoutlaw/KlipperXL-Plus](https://github.com/racoutlaw/KlipperXL-Plus)** · [Install guide](https://github.com/racoutlaw/KlipperXL-Plus/blob/main/docs/INSTALL.md)
+
+---
+
 KlipperXL replaces the stock Prusa firmware with [Klipper](https://www.klipper3d.org/), giving you full control over your Prusa XL through Mainsail or Fluidd. All 5 Dwarf toolheads work via MODBUS communication with the XLBuddy mainboard.
 
 [![KlipperXL Printing](https://img.youtube.com/vi/xOmtuuXfN5g/0.jpg)](https://www.youtube.com/watch?v=xOmtuuXfN5g)
