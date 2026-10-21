@@ -275,7 +275,11 @@ class ToolOffsets:
         if z_val is not None:
             new_z_offset = z_val
         else:
-            # Capture from current gcode offset
+            # Capture from current gcode offset - that is the active tool's
+            # live offset, so it only belongs to TOOL= if TOOL is active
+            if tool != self._get_active_tool_and_cal_offset()[0]:
+                raise gcmd.error("T%d is not the active tool - give Z= to set"
+                                 " its offset" % (tool,))
             gcode_move = self.printer.lookup_object("gcode_move")
             total_z = gcode_move.homing_position[2]
             new_z_offset = total_z + (cal_z - datum_cal_z)

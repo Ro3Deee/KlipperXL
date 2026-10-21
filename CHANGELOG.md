@@ -1,3 +1,70 @@
+## 2026-10-20
+
+Five fixes from a code review of `klippy/`. Each one changes only the case
+that was wrong; normal use behaves as before.
+
+### FIXED: a failed tool offset calibration left every tool offset at zero
+
+- `CALIBRATE_TOOL_OFFSETS` zeroes all tool offsets before it probes the pin.
+  If it then stopped on an error - a failed pick, the wrong tool on the
+  carriage, a rejected pin touch - the offsets stayed at zero, and the next
+  prints ran with no tool offsets, without any error, until a restart
+- Now the offsets in use before the run are put back, and the picked tool's
+  offset is sent again. A run that finishes - with or without `DRY_RUN=1` -
+  is unchanged
+
+### FIXED: a failed dock calibration check blocked tool changes until a restart
+
+- When a pick/park check cycle of `DOCK_CALIBRATE` failed, the dock position
+  was reverted and the calibration ended - but a leftover flag still marked
+  it as running, so `TOOL_PICK`, `TOOL_PARK` and `DOCK_CALIBRATE` refused
+  until Klipper was restarted
+- Now the flag is cleared with the rest of the calibration. A passing check
+  is unchanged
+
+### FIXED: `M190` waited forever if the bed stopped answering
+
+- The 10 minute heating timeout was only checked after a good bed reading, so
+  a bed that stopped answering kept `M190` waiting with no end
+- Now it stops after the same 10 minutes with
+  `Bed heating timeout (bed not answering)`. A bed that drops out for a moment
+  still recovers as before
+
+### FIXED: `LOAD_FILAMENT` / `UNLOAD_FILAMENT` for T0 ran T0 in its dock
+
+- After a boot with an empty carriage KlipperXL sets the active tool to 0
+  (for MODBUS commands) while no tool is picked. `LOAD_FILAMENT TOOL=0` and
+  `UNLOAD_FILAMENT TOOL=0` (or either with no `TOOL=`) then skipped the pick
+  and ran T0's extruder in its dock
+- Now they pick T0 first, as they already did for T1-T4. Filament autoload
+  (pushing filament into a tool) is unchanged
+
+### FIXED: `SAVE_TOOL_Z_OFFSET TOOL=n` without `Z=` saved the wrong value
+
+- Without `Z=` the value is read from the live Z offset, which belongs to the
+  picked tool. With T0 picked, `SAVE_TOOL_Z_OFFSET TOOL=3` stored T0's offset
+  plus T3's calibrated Z as T3's offset (in a test T3 went from 0.010 to 0.250)
+- Now that is refused with `T3 is not the active tool - give Z= to set its
+  offset`, and nothing is stored. The babystep save (no `TOOL=`), `TOOL=` for
+  the picked tool, and the documented `SAVE_TOOL_Z_OFFSET TOOL= Z=` are
+  unchanged
+
+**Tested** with Klipper's own Python against the real modules, only the
+hardware faked: every one of the cases above fails on the previous code and
+passes now, and the cases meant to stay the same (babystep save, a normal bed
+heat-up, loading with the tool already picked, a passing dock check, an error
+before the calibration zeroes anything) behave as before - 24 of 24. Not run
+on a KlipperXL install
+
+**To update** (in your KlipperXL folder, after `git pull`):
+
+```
+cp klippy/puppy_bootloader.py klippy/tool_offsets.py ~/klipper/klippy/extras/
+sudo systemctl restart klipper
+```
+
+Files: `klippy/puppy_bootloader.py`, `klippy/tool_offsets.py`
+
 ## 2026-10-10
 
 ### FIXED: Z alignment could drive the carriage into the right frame

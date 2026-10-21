@@ -1089,6 +1089,29 @@ class LoadcellProbe:
         return (cx, cy)
 
     def cmd_CALIBRATE_TOOL_OFFSETS(self, gcmd):
+        # The calibration zeroes every tool offset before probing. If it then
+        # stops on an error, put the old offsets back - otherwise the next
+        # prints run with no tool offsets until a restart.
+        self._cal_restore = None
+        try:
+            return self._calibrate_tool_offsets(gcmd)
+        except Exception:
+            if self._cal_restore is not None:
+                saved_offsets, saved_applied = self._cal_restore
+                self._cal_restore = None
+                self._puppy.tool_offsets.update(saved_offsets)
+                self._puppy.applied_tool_offset = saved_applied
+                active = self._puppy.active_tool
+                if active is not None and active >= 0:
+                    try:
+                        self._puppy._reapply_tool_offset(active)
+                    except Exception as e:
+                        logging.warning("Tool offset restore failed: %s" % (e,))
+                gcmd.respond_info("Calibration stopped - tool offsets restored"
+                                  " to their previous values")
+            raise
+
+    def _calibrate_tool_offsets(self, gcmd):
         """Automatic tool offset calibration using calibration pin.
 
         This implements Prusa's G425 calibration methodology:
@@ -1436,13 +1459,16 @@ class LoadcellProbe:
         gcmd.respond_info("Clearing bed mesh for calibration...")
         gcode.run_script_from_command("BED_MESH_CLEAR")
 
-        # Keep a copy of what was in use BEFORE zeroing. Two uses:
+        # Keep a copy of what was in use BEFORE zeroing. Three uses:
         #   1. the MEASURED vs CURRENT table - reading the live dict after this
         #      point would compare against zeros, not the real values
         #   2. DRY_RUN has to put them back, since it never reaches the code
         #      that would otherwise overwrite them
+        #   3. cmd_CALIBRATE_TOOL_OFFSETS puts them back if an error stops
+        #      the calibration before the new offsets are applied
         saved_offsets = dict(self._puppy.tool_offsets)
         saved_applied = self._puppy.applied_tool_offset
+        self._cal_restore = (saved_offsets, saved_applied)
 
         # Reset all tool offsets before calibration (Prusa: reset_hotend_offsets)
         # Old offsets would shift tool positions during probing and corrupt measurements
@@ -1737,6 +1763,9 @@ class LoadcellProbe:
             gcmd.respond_info("each tool afterwards.")
             self._tool_offsets = offsets
             return offsets
+
+        # Measuring is done - from here on the new offsets are the ones to keep
+        self._cal_restore = None
 
         # Apply offsets to working storage (used during tool changes)
         for tool_num, (ox, oy, oz) in offsets.items():
@@ -3519,8 +3548,9 @@ class PuppyBootloader:
         if dwarf not in self.booted_dwarfs:
             raise gcmd.error(f"T{tool}/Dwarf {dwarf} not booted")
 
-        # Pick tool if not active
-        if self.active_tool != tool:
+        # Pick tool if not active. After a boot with an empty carriage
+        # active_tool is 0 but nothing is picked, so check tool_picked too.
+        if not self.tool_picked or self.active_tool != tool:
             gcmd.respond_info(f"Picking T{tool}...")
             self.gcode.run_script_from_command(f"T{tool}")
 
@@ -3580,8 +3610,9 @@ class PuppyBootloader:
         if dwarf not in self.booted_dwarfs:
             raise gcmd.error(f"T{tool}/Dwarf {dwarf} not booted")
 
-        # Pick tool if not active
-        if self.active_tool != tool:
+        # Pick tool if not active. After a boot with an empty carriage
+        # active_tool is 0 but nothing is picked, so check tool_picked too.
+        if not self.tool_picked or self.active_tool != tool:
             gcmd.respond_info(f"Picking T{tool}...")
             self.gcode.run_script_from_command(f"T{tool}")
 
@@ -6954,9 +6985,14 @@ class PuppyBootloader:
                 self.gcode.respond_info(
                     f"Pick/Park cycle {cycle + 1}/"
                     f"{self.DOCK_CAL_VERIFY_CYCLES}: OK")
-        finally:
-            # Re-enable the guard (cleanup will clear it if we're done)
+        except BaseException:
+            # Re-enable the guard (the caller's cleanup clears it)
             self.dock_cal_active = True
+            raise
+        # Re-enable the guard (cleanup will clear it if we're done). Not in a
+        # finally: the failure returns above have already run cleanup, and
+        # re-arming after that blocks TOOL_PICK/TOOL_PARK until a restart.
+        self.dock_cal_active = True
 
         self.gcode.respond_info(
             f"\nDock {dock} calibration COMPLETE!")
@@ -8501,6 +8537,9 @@ class PuppyBootloader:
         while True:
             temps = self._read_bedlet_temperatures()
             if temps is None:
+                # Bed not answering: same 10 minute limit, or this waits forever
+                if self.reactor.monotonic() - start > timeout:
+                    raise gcmd.error("Bed heating timeout (bed not answering)")
                 self.reactor.pause(self.reactor.monotonic() + 1.0)
                 continue
 
